@@ -202,6 +202,46 @@ def detach_provider_from_groups(cfg, provider_name):
             g["use"] = [x for x in use if x != provider_name]
 
 
+def fetch_subscription(url, timeout=25):
+    """Fetch subscription with client-like headers and UA fallbacks.
+
+    Many airports return 403 to bare Python UA / short UA.
+    """
+    uas = [
+        # common clash clients
+        "clash.meta",
+        "ClashMeta/1.19.0",
+        "clash-verge/v2.0.0",
+        "ClashForWindows/0.20.39",
+        "mihomo/1.19.0",
+        # browser fallback for strict CDNs
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    ]
+    last_err = None
+    for ua in uas:
+        headers = {
+            "User-Agent": ua,
+            "Accept": "*/*",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        }
+        try:
+            req = urllib.request.Request(url, headers=headers, method="GET")
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                body = r.read(2 * 1024 * 1024)  # 2MB probe max for precheck
+                final = getattr(r, "geturl", lambda: url)()
+                status = getattr(r, "status", 200)
+                if body:
+                    return body, final, status
+                last_err = RuntimeError("empty subscription body")
+        except Exception as e:
+            last_err = e
+            msg = str(e)
+            # retry only on 403/401/429/5xx-ish; other errors still try next UA once
+            continue
+    raise RuntimeError(last_err)
+
 def add_provider(name, url, interval=3600):
     cfg = load_cfg()
     name = (name or "").strip()
@@ -216,14 +256,29 @@ def add_provider(name, url, interval=3600):
     providers = cfg.setdefault("proxy-providers", {})
     if name in providers:
         raise RuntimeError(f"provider exists: {name}")
+    warning = ""
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "clash.meta"})
-        with urllib.request.urlopen(req, timeout=20) as r:
-            body = r.read(64)
-            if not body:
-                raise RuntimeError("empty subscription body")
+        body, final_url, status = fetch_subscription(url)
+        if not body:
+            raise RuntimeError("empty subscription body")
+        if final_url and final_url != url:
+            url = final_url
+        head = body[:400].lstrip().lower()
+        if head.startswith(b"<!doctype html") or head.startswith(b"<html"):
+            raise RuntimeError(
+                f"subscription returned HTML (HTTP {status}); URL/token may be invalid"
+            )
     except Exception as e:
-        raise RuntimeError(f"fetch subscription failed: {e}")
+        msg = str(e)
+        # Airports often block VPS/datacenter IPs or non-client UAs with 403.
+        # Still write the provider and let mihomo pull it with its own client.
+        if any(x in msg for x in ("403", "401", "429", "Forbidden", "Unauthorized")):
+            warning = (
+                f"precheck failed ({msg}); provider saved, mihomo will retry pull. "
+                "If nodes stay empty, the airport may block this VPS IP."
+            )
+        else:
+            raise RuntimeError(f"fetch subscription failed: {e}")
     providers[name] = {
         "type": "http",
         "url": url,
@@ -238,13 +293,16 @@ def add_provider(name, url, interval=3600):
     attach_provider_to_groups(cfg, name)
     save_cfg(cfg)
     validate_and_restart()
-    return {
+    out = {
         "name": name,
         "type": "http",
         "url": url,
         "interval": interval,
         "path": f"./providers/{name}.yaml",
     }
+    if warning:
+        out["warning"] = warning
+    return out
 
 
 def del_provider(name):

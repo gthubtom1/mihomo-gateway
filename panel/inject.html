@@ -295,7 +295,7 @@ a.nav-link.mx-socks-item{cursor:pointer}
         interval: Number(document.getElementById('mx-prov-interval').value || 3600),
       };
       const j = await api('/panel-api/providers', {method:'POST', body: JSON.stringify(body)});
-      setMsg('Added provider: ' + j.name, true);
+      setMsg(j.warning ? ('Added provider: ' + j.name + ' | ' + j.warning) : ('Added provider: ' + j.name), true);
       document.getElementById('mx-prov-name').value = '';
       document.getElementById('mx-prov-url').value = '';
       await loadProviders();
