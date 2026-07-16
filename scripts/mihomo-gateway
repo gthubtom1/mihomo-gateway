@@ -1,0 +1,77 @@
+﻿#!/usr/bin/env bash
+set -euo pipefail
+
+ENV_FILE="/root/mihomo-gateway/env"
+CONFIG="/etc/mihomo/config.yaml"
+
+if [[ -f "${ENV_FILE}" ]]; then
+  # shellcheck disable=SC1090
+  source "${ENV_FILE}"
+fi
+
+need_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "missing $1"; exit 1; }; }
+need_cmd python3
+need_cmd systemctl
+need_cmd curl
+
+api() {
+  local method="$1"; shift
+  local path="$1"; shift
+  local secret="${MIHOMO_SECRET:-}"
+  [[ -n "${secret}" ]] || { echo "MIHOMO_SECRET missing in ${ENV_FILE}"; exit 1; }
+  curl -fsS -X "${method}" \
+    -H "Authorization: Bearer ${secret}" \
+    -H "Content-Type: application/json" \
+    "http://127.0.0.1:${PANEL_API_PORT:-9092}${path}" "$@"
+}
+
+cmd="${1:-status}"
+shift || true
+
+case "${cmd}" in
+  status)
+    systemctl is-active mihomo mihomo-gateway-api nginx || true
+    echo "panel: http://${PUBLIC_IP:-127.0.0.1}:${PANEL_PORT:-9090}/"
+    ;;
+  socks)
+    sub="${1:-list}"; shift || true
+    case "${sub}" in
+      list) api GET /panel-api/socks | python3 -m json.tool ;;
+      add)
+        port="${1:-}"; group="${2:-PROXY}"
+        [[ -n "${port}" ]] || { echo "usage: mihomo-gateway socks add <port> [group]"; exit 1; }
+        api POST /panel-api/socks -d "{\"port\":${port},\"group\":\"${group}\"}" | python3 -m json.tool
+        ;;
+      del)
+        port="${1:-}"
+        [[ -n "${port}" ]] || { echo "usage: mihomo-gateway socks del <port>"; exit 1; }
+        api DELETE "/panel-api/socks?port=${port}" | python3 -m json.tool
+        ;;
+      *) echo "usage: mihomo-gateway socks list|add|del"; exit 1 ;;
+    esac
+    ;;
+  provider)
+    sub="${1:-list}"; shift || true
+    case "${sub}" in
+      list) api GET /panel-api/providers | python3 -m json.tool ;;
+      add)
+        name="${1:-}"; url="${2:-}"; interval="${3:-3600}"
+        [[ -n "${name}" && -n "${url}" ]] || { echo "usage: mihomo-gateway provider add <name> <url> [interval]"; exit 1; }
+        api POST /panel-api/providers -d "{\"name\":\"${name}\",\"url\":\"${url}\",\"interval\":${interval}}" | python3 -m json.tool
+        ;;
+      del)
+        name="${1:-}"
+        [[ -n "${name}" ]] || { echo "usage: mihomo-gateway provider del <name>"; exit 1; }
+        api DELETE "/panel-api/providers?name=${name}" | python3 -m json.tool
+        ;;
+      *) echo "usage: mihomo-gateway provider list|add|del"; exit 1 ;;
+    esac
+    ;;
+  credentials)
+    cat /root/mihomo-gateway/credentials.txt
+    ;;
+  *)
+    echo "usage: mihomo-gateway status|socks|provider|credentials"
+    exit 1
+    ;;
+esac

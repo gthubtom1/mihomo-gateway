@@ -1,0 +1,46 @@
+﻿server {
+    listen __PANEL_PORT__;
+    listen [::]:__PANEL_PORT__;
+    server_name _;
+    client_max_body_size 50m;
+
+    location /panel-api/ {
+        proxy_pass http://127.0.0.1:__PANEL_API_PORT__;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header Authorization $http_authorization;
+    }
+
+    location ~ ^/(version|configs|proxies|proxy-providers|rules|rule-providers|connections|traffic|memory|logs|cache|dns|group|providers|upgrade|restart|flushfakeip|script|debug|meta)(/|$) {
+        proxy_pass http://127.0.0.1:9091;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_set_header Authorization $http_authorization;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_buffering off;
+    }
+
+    root /etc/mihomo/ui;
+    index index.html;
+
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    location /_nuxt/ {
+        try_files $uri =404;
+        access_log off;
+        expires 7d;
+    }
+
+    location /_fonts/ {
+        try_files $uri =404;
+        access_log off;
+        expires 30d;
+    }
+}

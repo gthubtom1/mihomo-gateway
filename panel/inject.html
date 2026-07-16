@@ -1,0 +1,327 @@
+﻿<style id="mx-gateway-style">
+#mx-socks-page{display:none;min-height:calc(100vh - 64px);padding:16px;color:var(--color-base-content,#e5e7eb);font-family:inherit}
+#mx-socks-page.show{display:block}
+#mx-socks-page .mx-wrap{width:min(1100px,100%);margin:0 auto}
+#mx-socks-page .mx-card{background:color-mix(in oklab,var(--color-base-200,#0b1220) 96%,transparent);border:1px solid color-mix(in oklab,var(--color-base-content,#fff) 10%,transparent);border-radius:14px;padding:14px;margin-bottom:12px}
+#mx-socks-page .mx-title{font-size:18px;font-weight:700;margin:0 0 12px}
+#mx-socks-page .mx-grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px}
+@media (max-width:1000px){#mx-socks-page .mx-grid{grid-template-columns:1fr 1fr}}
+#mx-socks-page label{display:block;font-size:12px;opacity:.7;margin-bottom:6px}
+#mx-socks-page input,#mx-socks-page select{width:100%;border-radius:10px;padding:10px 12px;background:color-mix(in oklab,var(--color-base-100,#000) 90%,transparent);border:1px solid color-mix(in oklab,var(--color-base-content,#fff) 12%,transparent);color:inherit;outline:none}
+#mx-socks-page button{border:0;border-radius:10px;padding:9px 12px;cursor:pointer;font-weight:600}
+#mx-socks-page .btn{background:var(--color-primary,#2563eb);color:#fff}
+#mx-socks-page .btn2{background:transparent;color:inherit;border:1px solid color-mix(in oklab,var(--color-base-content,#fff) 12%,transparent)}
+#mx-socks-page .btn-danger{background:color-mix(in oklab,#ef4444 12%,transparent);color:#fecaca;border:1px solid color-mix(in oklab,#ef4444 35%,transparent)}
+#mx-socks-page table{width:100%;border-collapse:collapse}
+#mx-socks-page th,#mx-socks-page td{padding:10px 8px;text-align:left;vertical-align:top;font-size:13px;border-bottom:1px solid color-mix(in oklab,var(--color-base-content,#fff) 8%,transparent)}
+#mx-socks-page th{opacity:.65;font-size:12px}
+#mx-socks-page .mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;word-break:break-all}
+#mx-socks-page .msg{display:none;margin:0 0 12px;padding:10px 12px;border-radius:10px;font-size:13px}
+#mx-socks-page .msg.ok{display:block;background:color-mix(in oklab,#22c55e 10%,transparent);border:1px solid color-mix(in oklab,#22c55e 28%,transparent)}
+#mx-socks-page .msg.err{display:block;background:color-mix(in oklab,#ef4444 10%,transparent);border:1px solid color-mix(in oklab,#ef4444 28%,transparent)}
+#mx-socks-page .chip{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;background:color-mix(in oklab,var(--color-base-content,#fff) 6%,transparent);border:1px solid color-mix(in oklab,var(--color-base-content,#fff) 10%,transparent)}
+a.nav-link.mx-socks-item{cursor:pointer}
+</style>
+<script id="mx-gateway-inject">
+(function(){
+  if (window.__MX_GATEWAY_INJECTED__) return;
+  window.__MX_GATEWAY_INJECTED__ = true;
+
+  function getSecret(){
+    try{
+      const id = JSON.parse(localStorage.getItem('selectedEndpoint') || 'null');
+      const list = JSON.parse(localStorage.getItem('endpointList') || '[]') || [];
+      const cur = list.find(x => x && x.id === id) || list[0];
+      if (cur && cur.secret) return cur.secret;
+    }catch(e){}
+    return '';
+  }
+
+  async function api(path, opts={}){
+    const secret = getSecret();
+    const headers = Object.assign({'Content-Type':'application/json'}, opts.headers||{});
+    if (secret) headers['Authorization'] = 'Bearer ' + secret;
+    const r = await fetch(path, {...opts, headers});
+    const text = await r.text();
+    let j; try { j = JSON.parse(text); } catch { j = {error:text}; }
+    if (!r.ok) throw new Error(j.error || text || ('HTTP ' + r.status));
+    return j;
+  }
+
+  function ensurePage(){
+    let page = document.getElementById('mx-socks-page');
+    if (page) return page;
+    page = document.createElement('div');
+    page.id = 'mx-socks-page';
+    page.innerHTML = `
+      <div class="mx-wrap">
+        <div class="mx-title">Gateway</div>
+        <div id="mx-socks-msg" class="msg"></div>
+        <div class="mx-card">
+          <div style="font-weight:600;margin-bottom:12px">Create SOCKS5</div>
+          <div class="mx-grid">
+            <div><label>Port</label><input id="mx-port" type="number" placeholder="1100"/></div>
+            <div><label>Group</label><select id="mx-group"></select></div>
+            <div><label>Name</label><input id="mx-name" placeholder="optional"/></div>
+            <div><label>Username</label><input id="mx-user" placeholder="default"/></div>
+            <div><label>Password</label><input id="mx-pass" placeholder="default"/></div>
+          </div>
+          <div style="margin-top:12px;display:flex;gap:8px">
+            <button class="btn" id="mx-create" type="button">Create</button>
+            <button class="btn2" id="mx-socks-refresh" type="button">Refresh</button>
+          </div>
+        </div>
+        <div class="mx-card" id="mx-provider-card">
+          <div style="font-weight:600;margin-bottom:12px">Subscription URL</div>
+          <div class="mx-grid" style="grid-template-columns:1.2fr 2fr 1fr auto;gap:10px">
+            <div><label>Name</label><input id="mx-prov-name" placeholder="airport3"/></div>
+            <div><label>URL</label><input id="mx-prov-url" placeholder="https://..."/></div>
+            <div><label>Interval(sec)</label><input id="mx-prov-interval" type="number" value="3600"/></div>
+            <div style="display:flex;align-items:end"><button class="btn" id="mx-prov-add" type="button">Add</button></div>
+          </div>
+          <div style="overflow:auto;margin-top:12px">
+            <table>
+              <thead><tr><th>Name</th><th>Type</th><th>URL/Path</th><th>Interval</th><th></th></tr></thead>
+              <tbody id="mx-prov-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+        <div class="mx-card">
+          <div style="font-weight:600;margin-bottom:12px">SOCKS5 Endpoints</div>
+          <div style="overflow:auto">
+            <table>
+              <thead><tr><th>Name</th><th>Port</th><th>Group</th><th>Auth</th><th>URL</th><th></th></tr></thead>
+              <tbody id="mx-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>`;
+    const content = document.querySelector('.drawer-content > div > div') || document.querySelector('.drawer-content') || document.body;
+    content.appendChild(page);
+    page.querySelector('#mx-create').onclick = createSocks;
+    page.querySelector('#mx-socks-refresh').onclick = () => { loadSocks(true); loadProviders(); };
+    page.querySelector('#mx-prov-add').onclick = addProvider;
+    return page;
+  }
+
+  function setMsg(text, ok){
+    const el = document.getElementById('mx-socks-msg');
+    if (!el) return;
+    if (!text) { el.className = 'msg'; el.textContent = ''; return; }
+    el.className = 'msg ' + (ok ? 'ok' : 'err');
+    el.textContent = text;
+  }
+
+  async function loadSocks(showOk){
+    try{
+      const data = await api('/panel-api/socks');
+      const sel = document.getElementById('mx-group');
+      const cur = sel.value;
+      sel.innerHTML = (data.groups || []).map(g => `<option value="${g}">${g}</option>`).join('');
+      if (cur) sel.value = cur;
+      const tb = document.getElementById('mx-tbody');
+      const rows = data.socks || [];
+      tb.innerHTML = rows.length ? rows.map(s => `
+        <tr>
+          <td><span class="chip">${s.name||''}</span></td>
+          <td class="mono">${s.port}</td>
+          <td><span class="chip">${s.group||''}</span></td>
+          <td class="mono">${s.user}<br>${s.password}</td>
+          <td><div class="mono">${s.url}</div>
+            <button class="btn2" style="margin-top:6px;padding:5px 8px;font-size:12px" data-url="${String(s.url).replaceAll('"','&quot;')}">Copy</button></td>
+          <td><button class="btn-danger" data-port="${s.port}">Delete</button></td>
+        </tr>`).join('') : `<tr><td colspan="6" style="opacity:.6;text-align:center;padding:24px">Empty</td></tr>`;
+      tb.querySelectorAll('button[data-url]').forEach(b => b.onclick = () => navigator.clipboard.writeText(b.getAttribute('data-url')));
+      tb.querySelectorAll('button[data-port]').forEach(b => b.onclick = () => delSocks(Number(b.getAttribute('data-port'))));
+      if (showOk) setMsg('Refreshed', true);
+    }catch(e){ setMsg(e.message || String(e), false); }
+  }
+
+  async function loadProviders(){
+    try{
+      const data = await api('/panel-api/providers');
+      const tb = document.getElementById('mx-prov-tbody');
+      if (!tb) return;
+      const rows = data.providers || [];
+      tb.innerHTML = rows.length ? rows.map(p => `
+        <tr>
+          <td><span class="chip">${p.name}</span>${p.protected ? ' <span class="chip">protected</span>' : ''}</td>
+          <td class="mono">${p.type||''}</td>
+          <td class="mono">${p.url||p.path||''}</td>
+          <td class="mono">${p.interval||'-'}</td>
+          <td>${p.protected ? '' : `<button class="btn-danger" data-name="${p.name}">Delete</button>`}</td>
+        </tr>`).join('') : `<tr><td colspan="5" style="opacity:.6;text-align:center;padding:16px">Empty</td></tr>`;
+      tb.querySelectorAll('button[data-name]').forEach(b => b.onclick = () => delProvider(b.getAttribute('data-name')));
+    }catch(e){ setMsg(e.message || String(e), false); }
+  }
+
+  async function createSocks(){
+    try{
+      setMsg('Creating...', true);
+      const body = {
+        port: Number(document.getElementById('mx-port').value),
+        group: document.getElementById('mx-group').value,
+        name: document.getElementById('mx-name').value || null,
+        user: document.getElementById('mx-user').value || null,
+        password: document.getElementById('mx-pass').value || null,
+      };
+      const j = await api('/panel-api/socks', {method:'POST', body: JSON.stringify(body)});
+      setMsg('Created: ' + j.url, true);
+      document.getElementById('mx-port').value = '';
+      document.getElementById('mx-name').value = '';
+      await loadSocks(false);
+    }catch(e){ setMsg(e.message || String(e), false); }
+  }
+
+  async function delSocks(port){
+    if (!confirm('Delete port ' + port + ' ?')) return;
+    try{
+      setMsg('Deleting...', true);
+      await api('/panel-api/socks?port=' + port, {method:'DELETE'});
+      setMsg('Deleted port ' + port, true);
+      await loadSocks(false);
+    }catch(e){ setMsg(e.message || String(e), false); }
+  }
+
+  async function addProvider(){
+    try{
+      setMsg('Adding subscription (restarts mihomo)...', true);
+      const body = {
+        name: document.getElementById('mx-prov-name').value.trim(),
+        url: document.getElementById('mx-prov-url').value.trim(),
+        interval: Number(document.getElementById('mx-prov-interval').value || 3600),
+      };
+      const j = await api('/panel-api/providers', {method:'POST', body: JSON.stringify(body)});
+      setMsg('Added provider: ' + j.name, true);
+      document.getElementById('mx-prov-name').value = '';
+      document.getElementById('mx-prov-url').value = '';
+      await loadProviders();
+    }catch(e){ setMsg(e.message || String(e), false); }
+  }
+
+  async function delProvider(name){
+    if (!confirm('Delete subscription ' + name + ' ?')) return;
+    try{
+      setMsg('Deleting...', true);
+      await api('/panel-api/providers?name=' + encodeURIComponent(name), {method:'DELETE'});
+      setMsg('Deleted: ' + name, true);
+      await loadProviders();
+    }catch(e){ setMsg(e.message || String(e), false); }
+  }
+
+  function hideNativeMain(hide){
+    const page = document.getElementById('mx-socks-page');
+    if (page && page.parentElement){
+      [...page.parentElement.children].forEach(ch => {
+        if (ch !== page) ch.style.display = hide ? 'none' : '';
+      });
+    }
+  }
+
+  function showSocks(ev){
+    if (ev){ ev.preventDefault(); ev.stopPropagation(); }
+    ensurePage();
+    document.getElementById('mx-socks-page').classList.add('show');
+    hideNativeMain(true);
+    document.querySelectorAll('a.nav-link').forEach(a => a.classList.remove('is-active'));
+    document.querySelectorAll('a.nav-link .nav-link__indicator').forEach(n => n.remove());
+    const item = document.getElementById('mx-socks-nav');
+    if (item){
+      item.classList.add('is-active');
+      if (!item.querySelector('.nav-link__indicator')){
+        const ind = document.createElement('span');
+        ind.className = 'nav-link__indicator absolute top-1/2 left-0 -translate-y-1/2 rounded-r-full bg-primary';
+        ind.setAttribute('aria-hidden', 'true');
+        const glow = item.querySelector('.nav-link__glow');
+        if (glow) glow.after(ind); else item.prepend(ind);
+      }
+    }
+    loadSocks(false);
+    loadProviders();
+    try { history.replaceState(null, '', '#socks5'); } catch(e){}
+  }
+
+  function hideSocks(){
+    const page = document.getElementById('mx-socks-page');
+    if (page) page.classList.remove('show');
+    hideNativeMain(false);
+    const item = document.getElementById('mx-socks-nav');
+    if (item){
+      item.classList.remove('is-active');
+      item.querySelectorAll('.nav-link__indicator').forEach(n => n.remove());
+    }
+  }
+
+  function makeNavItem(template){
+    const a = template.cloneNode(true);
+    a.id = 'mx-socks-nav';
+    a.classList.add('mx-socks-item');
+    a.classList.remove('is-active', 'router-link-active', 'router-link-exact-active');
+    a.setAttribute('href', '#socks5');
+    a.removeAttribute('aria-current');
+    a.querySelectorAll('.nav-link__indicator').forEach(n => n.remove());
+    let textSpan = null;
+    a.querySelectorAll('span').forEach(s => {
+      if (s.classList.contains('nav-link__glow') || s.classList.contains('nav-link__indicator') || s.classList.contains('nav-link__icon')) return;
+      if ((s.textContent || '').trim()) textSpan = s;
+    });
+    if (textSpan) textSpan.textContent = 'SOCKS5';
+    const iconHost = a.querySelector('.nav-link__icon');
+    if (iconHost){
+      iconHost.innerHTML = `<svg class="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 22v-6"/><path d="M9 8V2"/><path d="M15 8V2"/><path d="M7 8h10"/><path d="M6 12h12a2 2 0 0 1 2 2v2a4 4 0 0 1-4 4H8a4 4 0 0 1-4-4v-2a2 2 0 0 1 2-2z"/></svg>`;
+    }
+    a.title = 'SOCKS5';
+    a.onclick = showSocks;
+    return a;
+  }
+
+  function injectSidebar(){
+    if (document.getElementById('mx-socks-nav')) return true;
+    const links = [...document.querySelectorAll('a.nav-link')].filter(a => {
+      const href = a.getAttribute('href') || '';
+      return href.includes('/overview') || href.includes('/proxies') || href.includes('/config') || href.includes('/rules');
+    });
+    if (!links.length) return false;
+    const template = links[0];
+    const li = template.closest('li') || template.parentElement;
+    const ul = li ? li.parentElement : null;
+    if (!ul) return false;
+    const item = makeNavItem(template);
+    if (li && li.tagName === 'LI'){
+      const newLi = li.cloneNode(false);
+      newLi.className = li.className || 'nav-stagger';
+      newLi.removeAttribute('style');
+      newLi.appendChild(item);
+      let configLi = null;
+      [...ul.querySelectorAll('a.nav-link')].forEach(a => {
+        const href = a.getAttribute('href') || '';
+        if (href.includes('/config')) configLi = a.closest('li');
+      });
+      if (configLi) ul.insertBefore(newLi, configLi); else ul.appendChild(newLi);
+    } else {
+      template.parentElement.appendChild(item);
+    }
+    document.querySelectorAll('a.nav-link:not(.mx-socks-item)').forEach(a => {
+      a.addEventListener('click', () => hideSocks(), true);
+    });
+    return true;
+  }
+
+  // Prefer official endpoint storage. Do NOT hardcode secrets into JS for public repos.
+  try{
+    if (!window.__METACUBEXD_CONFIG__) window.__METACUBEXD_CONFIG__ = {};
+    window.__METACUBEXD_CONFIG__.defaultBackendURL = location.origin;
+  }catch(e){}
+
+  function boot(){
+    injectSidebar();
+    if (location.hash === '#socks5') showSocks();
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
+  setInterval(() => { injectSidebar(); }, 1000);
+  window.addEventListener('hashchange', () => {
+    if (location.hash === '#socks5') showSocks(); else hideSocks();
+  });
+})();
+</script>

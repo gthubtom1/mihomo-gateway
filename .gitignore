@@ -1,0 +1,25 @@
+# secrets
+credentials.txt
+*.secret
+.env
+.env.*
+*.pem
+*.key
+
+# editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# temp
+tmp/
+*.log
+*.tmp
+.cursor/

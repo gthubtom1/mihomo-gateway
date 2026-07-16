@@ -1,0 +1,20 @@
+﻿mixed-port: 0
+port: 0
+socks-port: 0
+allow-lan: true
+bind-address: "*"
+mode: rule
+log-level: info
+ipv6: true
+external-controller: 127.0.0.1:9091
+secret: "CHANGE_ME"
+external-ui: ui
+profile:
+  store-selected: true
+  store-fake-ip: true
+
+proxy-providers: {}
+proxy-groups: []
+listeners: []
+rules:
+  - MATCH,DIRECT

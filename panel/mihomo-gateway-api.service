@@ -1,0 +1,20 @@
+﻿[Unit]
+Description=Mihomo Gateway management API
+After=network-online.target mihomo.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=PANEL_API_HOST=127.0.0.1
+Environment=PANEL_API_PORT=__PANEL_API_PORT__
+Environment=MIHOMO_SECRET=__MIHOMO_SECRET__
+Environment=PUBLIC_IP=__PUBLIC_IP__
+Environment=MIHOMO_CONFIG=/etc/mihomo/config.yaml
+Environment=PROTECTED_PROVIDERS=custom
+WorkingDirectory=__INSTALL_ROOT__/panel
+ExecStart=/usr/bin/python3 __INSTALL_ROOT__/panel/app.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
