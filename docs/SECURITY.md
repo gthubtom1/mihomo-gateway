@@ -1,4 +1,4 @@
-﻿# Security Notes
+# Security Notes
 
 ## What this project does NOT commit
 

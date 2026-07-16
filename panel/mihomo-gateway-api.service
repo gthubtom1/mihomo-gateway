@@ -1,4 +1,4 @@
-﻿[Unit]
+[Unit]
 Description=Mihomo Gateway management API
 After=network-online.target mihomo.service
 Wants=network-online.target

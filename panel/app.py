@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """Local management API for SOCKS listeners and subscription providers."""
 import json
 import os

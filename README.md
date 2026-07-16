@@ -1,4 +1,4 @@
-﻿# Mihomo Gateway
+# Mihomo Gateway
 
 One-click Mihomo (Clash.Meta) public SOCKS5 gateway for VPS, with MetaCubeXD panel and subscription/port management.
 

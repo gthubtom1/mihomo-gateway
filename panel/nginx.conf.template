@@ -1,4 +1,4 @@
-﻿server {
+server {
     listen __PANEL_PORT__;
     listen [::]:__PANEL_PORT__;
     server_name _;

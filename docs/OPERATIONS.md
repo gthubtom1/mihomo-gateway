@@ -1,4 +1,4 @@
-﻿# Operations
+# Operations
 
 ## Service map
 
