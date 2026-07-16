@@ -23,3 +23,7 @@ tmp/
 *.log
 *.tmp
 .cursor/
+
+# local temp
+_*.py
+
