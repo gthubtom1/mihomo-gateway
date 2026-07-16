@@ -27,24 +27,79 @@ a.nav-link.mx-socks-item{cursor:pointer}
   if (window.__MX_GATEWAY_INJECTED__) return;
   window.__MX_GATEWAY_INJECTED__ = true;
 
+  function readStore(key){
+    try{
+      const raw = localStorage.getItem(key);
+      if (raw == null || raw === '') return null;
+      try { return JSON.parse(raw); } catch(e){ return raw; }
+    }catch(e){ return null; }
+  }
+
   function getSecret(){
     try{
-      const id = JSON.parse(localStorage.getItem('selectedEndpoint') || 'null');
-      const list = JSON.parse(localStorage.getItem('endpointList') || '[]') || [];
-      const cur = list.find(x => x && x.id === id) || list[0];
-      if (cur && cur.secret) return cur.secret;
+      const manual = (localStorage.getItem('mx-gateway-secret') || '').trim();
+      if (manual) return manual;
+    }catch(e){}
+
+    try{
+      const id = readStore('selectedEndpoint');
+      let list = readStore('endpointList');
+      if (!Array.isArray(list)) list = [];
+      const cur = list.find(x => x && (x.id === id || String(x.id) === String(id))) || list[0];
+      if (cur && cur.secret) return String(cur.secret);
+      for (const ep of list){
+        if (ep && ep.secret) return String(ep.secret);
+      }
+    }catch(e){}
+
+    try{
+      for (let i = 0; i < localStorage.length; i++){
+        const k = localStorage.key(i);
+        if (!k) continue;
+        let v;
+        try { v = JSON.parse(localStorage.getItem(k) || 'null'); } catch(e){ continue; }
+        if (Array.isArray(v)){
+          for (const item of v){
+            if (item && typeof item === 'object' && item.secret && (item.url || item.id)){
+              return String(item.secret);
+            }
+          }
+        } else if (v && typeof v === 'object' && v.secret && (v.url || v.id)){
+          return String(v.secret);
+        }
+      }
     }catch(e){}
     return '';
   }
 
+  function setManualSecret(secret){
+    const s = (secret || '').trim();
+    if (!s) {
+      try { localStorage.removeItem('mx-gateway-secret'); } catch(e){}
+      return false;
+    }
+    try { localStorage.setItem('mx-gateway-secret', s); } catch(e){}
+    return true;
+  }
+
   async function api(path, opts={}){
     const secret = getSecret();
+    if (!secret) {
+      throw new Error('unauthorized: 请先在面板设置里填写 Secret，或在本页粘贴 Secret');
+    }
     const headers = Object.assign({'Content-Type':'application/json'}, opts.headers||{});
-    if (secret) headers['Authorization'] = 'Bearer ' + secret;
+    headers['Authorization'] = 'Bearer ' + secret;
+    headers['X-Secret'] = secret;
     const r = await fetch(path, {...opts, headers});
     const text = await r.text();
     let j; try { j = JSON.parse(text); } catch { j = {error:text}; }
-    if (!r.ok) throw new Error(j.error || text || ('HTTP ' + r.status));
+    if (!r.ok) {
+      const msg = j.error || text || ('HTTP ' + r.status);
+      if (String(msg).toLowerCase().includes('unauthorized') || r.status === 401){
+        throw new Error('unauthorized: Secret 不正确或未填写。请到设置页确认，或在本页粘贴正确 Secret');
+      }
+      throw new Error(msg);
+    }
     return j;
   }
 
@@ -57,6 +112,19 @@ a.nav-link.mx-socks-item{cursor:pointer}
       <div class="mx-wrap">
         <div class="mx-title">Gateway</div>
         <div id="mx-socks-msg" class="msg"></div>
+        <div class="mx-card" id="mx-secret-card">
+          <div style="font-weight:600;margin-bottom:8px">API Secret</div>
+          <div style="font-size:12px;opacity:.7;margin-bottom:10px">Gateway 管理接口需要与面板相同的 Secret。优先使用设置页已保存的密钥；也可在此粘贴（仅保存在本浏览器）。</div>
+          <div style="display:grid;grid-template-columns:1fr auto auto;gap:8px;align-items:end">
+            <div>
+              <label>Secret</label>
+              <input id="mx-secret" type="password" placeholder="paste install secret" autocomplete="off"/>
+            </div>
+            <button class="btn" id="mx-secret-save" type="button">Save</button>
+            <button class="btn2" id="mx-secret-clear" type="button">Clear</button>
+          </div>
+          <div id="mx-secret-status" style="margin-top:8px;font-size:12px;opacity:.75"></div>
+        </div>
         <div class="mx-card">
           <div style="font-weight:600;margin-bottom:12px">Create SOCKS5</div>
           <div class="mx-grid">
@@ -101,7 +169,42 @@ a.nav-link.mx-socks-item{cursor:pointer}
     page.querySelector('#mx-create').onclick = createSocks;
     page.querySelector('#mx-socks-refresh').onclick = () => { loadSocks(true); loadProviders(); };
     page.querySelector('#mx-prov-add').onclick = addProvider;
+    page.querySelector('#mx-secret-save').onclick = () => {
+      const v = document.getElementById('mx-secret').value || '';
+      if (!setManualSecret(v)) { setMsg('Secret 不能为空', false); return; }
+      setMsg('Secret 已保存到本浏览器', true);
+      updateSecretStatus();
+      loadSocks(false);
+      loadProviders();
+    };
+    page.querySelector('#mx-secret-clear').onclick = () => {
+      setManualSecret('');
+      document.getElementById('mx-secret').value = '';
+      setMsg('已清除本页 Secret 覆盖', true);
+      updateSecretStatus();
+    };
+    updateSecretStatus();
     return page;
+  }
+
+  function updateSecretStatus(){
+    const el = document.getElementById('mx-secret-status');
+    if (!el) return;
+    const secret = getSecret();
+    const manual = (()=>{ try { return !!(localStorage.getItem('mx-gateway-secret')||'').trim(); } catch(e){ return false; } })();
+    if (!secret){
+      el.textContent = '状态: 未找到 Secret（会显示 unauthorized）';
+      el.style.color = '#fca5a5';
+      return;
+    }
+    el.textContent = manual
+      ? '状态: 使用本页保存的 Secret（' + secret.slice(0,4) + '…' + secret.slice(-4) + '）'
+      : '状态: 使用面板设置中的 Secret（' + secret.slice(0,4) + '…' + secret.slice(-4) + '）';
+    el.style.color = '';
+    const input = document.getElementById('mx-secret');
+    if (input && !input.value && manual){
+      try { input.value = localStorage.getItem('mx-gateway-secret') || ''; } catch(e){}
+    }
   }
 
   function setMsg(text, ok){
@@ -236,6 +339,7 @@ a.nav-link.mx-socks-item{cursor:pointer}
         if (glow) glow.after(ind); else item.prepend(ind);
       }
     }
+    updateSecretStatus();
     loadSocks(false);
     loadProviders();
     try { history.replaceState(null, '', '#socks5'); } catch(e){}
