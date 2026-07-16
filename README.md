@@ -20,13 +20,13 @@ One-click Mihomo (Clash.Meta) public SOCKS5 gateway for VPS, with MetaCubeXD pan
 ## One-click install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/OWNER/mihomo-gateway/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/gthubtom1/mihomo-gateway/main/install.sh | bash
 ```
 
 Or:
 
 ```bash
-git clone https://github.com/OWNER/mihomo-gateway.git
+git clone https://github.com/gthubtom1/mihomo-gateway.git
 cd mihomo-gateway
 bash install.sh
 ```
@@ -99,3 +99,4 @@ See [docs/SECURITY.md](docs/SECURITY.md).
 ## License
 
 MIT
+
