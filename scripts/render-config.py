@@ -45,18 +45,8 @@ def main():
     cfg["secret"] = args.secret
     cfg["external-ui"] = "ui"
 
-    providers = {
-        "custom": {
-            "type": "file",
-            "path": "./providers/custom.yaml",
-            "health-check": {
-                "enable": True,
-                "interval": 600,
-                "url": "https://www.gstatic.com/generate_204",
-            },
-        }
-    }
-    provider_names = ["custom"]
+    providers = {}
+    provider_names = []
     for name, url in parse_sub_urls(args.sub_urls):
         providers[name] = {
             "type": "http",
@@ -84,6 +74,7 @@ def main():
         "name": "AUTO",
         "type": "url-test",
         "use": provider_names,
+        "proxies": ["DIRECT"],
         "url": "https://www.gstatic.com/generate_204",
         "interval": 300,
         "tolerance": 80,
@@ -92,6 +83,7 @@ def main():
         "name": "GPT",
         "type": "url-test",
         "use": provider_names,
+        "proxies": ["DIRECT"],
         "filter": r"(?i)(gpt|openai|chatgpt|解锁|原生|美国|美國|日本|新加坡|台湾|臺灣|us|usa|jp|japan|sg|singapore|tw|taiwan)",
         "url": "https://www.gstatic.com/generate_204",
         "interval": 300,
@@ -108,6 +100,7 @@ def main():
             "name": gname,
             "type": "url-test",
             "use": provider_names,
+            "proxies": ["DIRECT"],
             "filter": flt,
             "url": "https://www.gstatic.com/generate_204",
             "interval": 300,
@@ -120,13 +113,14 @@ def main():
         "name": "故障转移",
         "type": "fallback",
         "use": provider_names,
+        "proxies": ["DIRECT"],
         "url": "https://www.gstatic.com/generate_204",
         "interval": 300,
     })
     groups.append({
         "name": "自定义",
         "type": "select",
-        "use": ["custom"],
+        "use": provider_names,
         "proxies": ["DIRECT"],
     })
     cfg["proxy-groups"] = groups

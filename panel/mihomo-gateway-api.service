@@ -10,7 +10,7 @@ Environment=PANEL_API_PORT=__PANEL_API_PORT__
 Environment=MIHOMO_SECRET=__MIHOMO_SECRET__
 Environment=PUBLIC_IP=__PUBLIC_IP__
 Environment=MIHOMO_CONFIG=/etc/mihomo/config.yaml
-Environment=PROTECTED_PROVIDERS=custom
+Environment=PROTECTED_PROVIDERS=
 WorkingDirectory=__INSTALL_ROOT__/panel
 ExecStart=/usr/bin/python3 __INSTALL_ROOT__/panel/app.py
 Restart=always

@@ -7,6 +7,7 @@ import secrets
 import subprocess
 import time
 import urllib.request
+from html import unescape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -15,12 +16,13 @@ import yaml
 
 HOST_PUBLIC = os.environ.get("PUBLIC_IP", "127.0.0.1")
 CONFIG = Path(os.environ.get("MIHOMO_CONFIG", "/etc/mihomo/config.yaml"))
+PROVIDERS_DIR = Path(os.environ.get("MIHOMO_PROVIDERS_DIR", str(CONFIG.parent / "providers")))
 BACKUP_DIR = Path(os.environ.get("MIHOMO_BACKUP_DIR", "/root/mihomo-backups"))
 MIHOMO_SECRET = os.environ.get("MIHOMO_SECRET", "")
 LISTEN_HOST = os.environ.get("PANEL_API_HOST", "127.0.0.1")
 LISTEN_PORT = int(os.environ.get("PANEL_API_PORT", "9092"))
 PROTECTED_PROVIDERS = set(
-    x.strip() for x in os.environ.get("PROTECTED_PROVIDERS", "custom").split(",") if x.strip()
+    x.strip() for x in os.environ.get("PROTECTED_PROVIDERS", "").split(",") if x.strip()
 )
 
 
@@ -31,9 +33,76 @@ def load_cfg():
 def save_cfg(cfg):
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     if CONFIG.exists():
-        bak = BACKUP_DIR / f"config.yaml.{time.strftime('%Y%m%d-%H%M%S')}"
-        bak.write_text(CONFIG.read_text(encoding="utf-8"), encoding="utf-8")
-    CONFIG.write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False), encoding="utf-8")
+        bak = BACKUP_DIR / f"config.yaml.{time.strftime('%Y%m%d-%H%M%S')}-{time.time_ns()}"
+        bak.write_bytes(CONFIG.read_bytes())
+    raw = yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False).encode("utf-8")
+    _atomic_write(CONFIG, raw)
+
+
+def _atomic_write(path, raw):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_bytes(raw)
+    os.chmod(tmp, 0o600)
+    tmp.replace(path)
+
+
+def _restore_config(raw):
+    _atomic_write(CONFIG, raw)
+
+
+def _safe_provider_path(name):
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", name or ""):
+        raise RuntimeError("name invalid: use A-Za-z0-9_- (1-32)")
+    return PROVIDERS_DIR / f"{name}.yaml"
+
+
+def _find_orphan_path(name):
+    name = (name or "").strip()
+    if not name or len(name) > 128 or name in {".", ".."}:
+        return None
+    if "/" in name or "\\" in name:
+        return None
+    if not PROVIDERS_DIR.exists():
+        return None
+    for path in PROVIDERS_DIR.glob("*.y*ml"):
+        if path.stem == name and path.resolve().parent == PROVIDERS_DIR.resolve():
+            return path
+    return None
+
+
+def _provider_path(name, provider=None):
+    raw = (provider or {}).get("path") or f"./providers/{name}.yaml"
+    path = Path(raw)
+    if not path.is_absolute():
+        path = CONFIG.parent / path
+    path = path.resolve()
+    root = PROVIDERS_DIR.resolve()
+    if path.parent != root:
+        raise RuntimeError(f"unsafe provider path: {raw}")
+    return path
+
+
+def _provider_node_count(path):
+    if not path.exists():
+        return 0
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8-sig")) or {}
+        proxies = data.get("proxies") if isinstance(data, dict) else None
+        return len(proxies) if isinstance(proxies, list) else 0
+    except Exception:
+        return 0
+
+
+def _backup_provider_file(path):
+    if not path.exists():
+        return None
+    target_dir = BACKUP_DIR / "providers"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / f"{path.name}.{time.strftime('%Y%m%d-%H%M%S')}-{time.time_ns()}"
+    target.write_bytes(path.read_bytes())
+    os.chmod(target, 0o600)
+    return target
 
 
 def group_names(cfg):
@@ -63,7 +132,16 @@ def list_socks(cfg):
 
 def list_providers(cfg):
     rows = []
+    configured_paths = set()
     for name, p in (cfg.get("proxy-providers") or {}).items():
+        try:
+            path = _provider_path(name, p)
+            configured_paths.add(path)
+            exists = path.exists()
+            nodes = _provider_node_count(path)
+        except RuntimeError:
+            exists = False
+            nodes = 0
         rows.append({
             "name": name,
             "type": p.get("type"),
@@ -71,7 +149,24 @@ def list_providers(cfg):
             "path": p.get("path") or "",
             "interval": p.get("interval"),
             "protected": name in PROTECTED_PROVIDERS,
+            "status": "active" if exists else "missing",
+            "nodes": nodes,
         })
+    if PROVIDERS_DIR.exists():
+        for path in sorted(PROVIDERS_DIR.glob("*.y*ml")):
+            resolved = path.resolve()
+            if resolved in configured_paths:
+                continue
+            rows.append({
+                "name": path.stem,
+                "type": "orphan",
+                "url": "",
+                "path": str(path),
+                "interval": None,
+                "protected": False,
+                "status": "orphan",
+                "nodes": _provider_node_count(path),
+            })
     rows.sort(key=lambda x: x["name"])
     return rows
 
@@ -81,15 +176,18 @@ def validate_and_restart():
     if p.returncode != 0:
         raise RuntimeError((p.stdout or "") + (p.stderr or ""))
     subprocess.check_call(["systemctl", "restart", "mihomo"])
+    last_error = None
     for _ in range(50):
         try:
             urllib.request.urlopen(urllib.request.Request(
                 "http://127.0.0.1:9091/version",
                 headers={"Authorization": f"Bearer {MIHOMO_SECRET}"},
             ), timeout=2)
-            break
-        except Exception:
+            return
+        except Exception as e:
+            last_error = e
             time.sleep(0.25)
+    raise RuntimeError(f"mihomo did not become ready after restart: {last_error}")
 
 
 def ufw_allow(port):
@@ -188,8 +286,6 @@ def attach_provider_to_groups(cfg, provider_name):
         use = g.get("use")
         if not isinstance(use, list):
             continue
-        if g.get("name") == "自定义" and use == ["custom"]:
-            continue
         if provider_name not in use:
             use.append(provider_name)
             g["use"] = use
@@ -223,6 +319,7 @@ def fetch_subscription(url, timeout=25):
             "User-Agent": ua,
             "Accept": "*/*",
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Accept-Encoding": "identity",
             "Cache-Control": "no-cache",
             "Pragma": "no-cache",
         }
@@ -233,19 +330,45 @@ def fetch_subscription(url, timeout=25):
                 final = getattr(r, "geturl", lambda: url)()
                 status = getattr(r, "status", 200)
                 if body:
-                    return body, final, status
+                    return body, final, status, ua
                 last_err = RuntimeError("empty subscription body")
         except Exception as e:
             last_err = e
-            msg = str(e)
-            # retry only on 403/401/429/5xx-ish; other errors still try next UA once
             continue
     raise RuntimeError(last_err)
+
+
+def normalize_subscription(body):
+    try:
+        text = body.decode("utf-8-sig")
+    except UnicodeDecodeError as e:
+        raise RuntimeError(f"subscription is not UTF-8 Clash YAML: {e}")
+    try:
+        data = yaml.safe_load(text)
+    except yaml.YAMLError as e:
+        raise RuntimeError(f"subscription is not valid Clash YAML: {e}")
+    if not isinstance(data, dict):
+        raise RuntimeError(
+            "subscription is not Clash/Mihomo YAML; select the Clash subscription URL"
+        )
+    proxies = data.get("proxies")
+    if not isinstance(proxies, list) or not proxies:
+        raise RuntimeError(
+            "subscription contains no proxies; select the Clash/Mihomo subscription URL"
+        )
+    for index, proxy in enumerate(proxies, 1):
+        if not isinstance(proxy, dict) or not proxy.get("name") or not proxy.get("type"):
+            raise RuntimeError(f"invalid proxy at item {index}: name/type required")
+    normalized = yaml.safe_dump(
+        {"proxies": proxies}, allow_unicode=True, sort_keys=False
+    ).encode("utf-8")
+    return normalized, len(proxies)
+
 
 def add_provider(name, url, interval=3600):
     cfg = load_cfg()
     name = (name or "").strip()
-    url = (url or "").strip()
+    url = unescape((url or "").strip())
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", name):
         raise RuntimeError("name invalid: use A-Za-z0-9_- (1-32)")
     if name in PROTECTED_PROVIDERS:
@@ -256,34 +379,25 @@ def add_provider(name, url, interval=3600):
     providers = cfg.setdefault("proxy-providers", {})
     if name in providers:
         raise RuntimeError(f"provider exists: {name}")
-    warning = ""
+    cache_path = _safe_provider_path(name)
+    if cache_path.exists():
+        raise RuntimeError(
+            f"orphan provider file exists: {cache_path.name}; delete it first"
+        )
     try:
-        body, final_url, status = fetch_subscription(url)
-        if not body:
-            raise RuntimeError("empty subscription body")
+        body, final_url, _status, user_agent = fetch_subscription(url)
         if final_url and final_url != url:
             url = final_url
-        head = body[:400].lstrip().lower()
-        if head.startswith(b"<!doctype html") or head.startswith(b"<html"):
-            raise RuntimeError(
-                f"subscription returned HTML (HTTP {status}); URL/token may be invalid"
-            )
+        normalized, node_count = normalize_subscription(body)
     except Exception as e:
-        msg = str(e)
-        # Airports often block VPS/datacenter IPs or non-client UAs with 403.
-        # Still write the provider and let mihomo pull it with its own client.
-        if any(x in msg for x in ("403", "401", "429", "Forbidden", "Unauthorized")):
-            warning = (
-                f"precheck failed ({msg}); provider saved, mihomo will retry pull. "
-                "If nodes stay empty, the airport may block this VPS IP."
-            )
-        else:
-            raise RuntimeError(f"fetch subscription failed: {e}")
+        raise RuntimeError(f"fetch subscription failed: {e}")
+    original_config = CONFIG.read_bytes()
     providers[name] = {
         "type": "http",
         "url": url,
         "interval": interval,
         "path": f"./providers/{name}.yaml",
+        "header": {"User-Agent": [user_agent]},
         "health-check": {
             "enable": True,
             "interval": 600,
@@ -291,18 +405,26 @@ def add_provider(name, url, interval=3600):
         },
     }
     attach_provider_to_groups(cfg, name)
-    save_cfg(cfg)
-    validate_and_restart()
-    out = {
+    try:
+        _atomic_write(cache_path, normalized)
+        save_cfg(cfg)
+        validate_and_restart()
+    except Exception:
+        _restore_config(original_config)
+        cache_path.unlink(missing_ok=True)
+        try:
+            validate_and_restart()
+        except Exception:
+            pass
+        raise
+    return {
         "name": name,
         "type": "http",
         "url": url,
         "interval": interval,
         "path": f"./providers/{name}.yaml",
+        "nodes": node_count,
     }
-    if warning:
-        out["warning"] = warning
-    return out
 
 
 def del_provider(name):
@@ -312,19 +434,41 @@ def del_provider(name):
         raise RuntimeError(f"protected provider cannot delete: {name}")
     providers = cfg.get("proxy-providers") or {}
     if name not in providers:
-        raise RuntimeError("provider not found")
+        orphan = _find_orphan_path(name)
+        if orphan is None:
+            raise RuntimeError("provider not found")
+        backup = _backup_provider_file(orphan)
+        orphan.unlink()
+        return {
+            "name": name,
+            "deleted": True,
+            "orphan": True,
+            "backup": str(backup) if backup else "",
+        }
+    original_config = CONFIG.read_bytes()
+    provider = providers[name]
+    path = _provider_path(name, provider)
     del providers[name]
     cfg["proxy-providers"] = providers
     detach_provider_from_groups(cfg, name)
-    p = Path(f"/etc/mihomo/providers/{name}.yaml")
-    if p.exists():
+    try:
+        save_cfg(cfg)
+        validate_and_restart()
+    except Exception:
+        _restore_config(original_config)
         try:
-            p.unlink()
+            validate_and_restart()
         except Exception:
             pass
-    save_cfg(cfg)
-    validate_and_restart()
-    return {"name": name, "deleted": True}
+        raise
+    backup = _backup_provider_file(path)
+    path.unlink(missing_ok=True)
+    return {
+        "name": name,
+        "deleted": True,
+        "orphan": False,
+        "backup": str(backup) if backup else "",
+    }
 
 
 class H(BaseHTTPRequestHandler):

@@ -149,7 +149,7 @@ a.nav-link.mx-socks-item{cursor:pointer}
           </div>
           <div style="overflow:auto;margin-top:12px">
             <table>
-              <thead><tr><th>Name</th><th>Type</th><th>URL/Path</th><th>Interval</th><th></th></tr></thead>
+              <thead><tr><th>Name</th><th>Status</th><th>Nodes</th><th>Type</th><th>URL/Path</th><th>Interval</th><th></th></tr></thead>
               <tbody id="mx-prov-tbody"></tbody>
             </table>
           </div>
@@ -249,11 +249,13 @@ a.nav-link.mx-socks-item{cursor:pointer}
       tb.innerHTML = rows.length ? rows.map(p => `
         <tr>
           <td><span class="chip">${p.name}</span>${p.protected ? ' <span class="chip">protected</span>' : ''}</td>
+          <td><span class="chip">${p.status||'unknown'}</span></td>
+          <td class="mono">${Number(p.nodes||0)}</td>
           <td class="mono">${p.type||''}</td>
           <td class="mono">${p.url||p.path||''}</td>
           <td class="mono">${p.interval||'-'}</td>
           <td>${p.protected ? '' : `<button class="btn-danger" data-name="${p.name}">Delete</button>`}</td>
-        </tr>`).join('') : `<tr><td colspan="5" style="opacity:.6;text-align:center;padding:16px">Empty</td></tr>`;
+        </tr>`).join('') : `<tr><td colspan="7" style="opacity:.6;text-align:center;padding:16px">Empty</td></tr>`;
       tb.querySelectorAll('button[data-name]').forEach(b => b.onclick = () => delProvider(b.getAttribute('data-name')));
     }catch(e){ setMsg(e.message || String(e), false); }
   }
@@ -295,7 +297,7 @@ a.nav-link.mx-socks-item{cursor:pointer}
         interval: Number(document.getElementById('mx-prov-interval').value || 3600),
       };
       const j = await api('/panel-api/providers', {method:'POST', body: JSON.stringify(body)});
-      setMsg(j.warning ? ('Added provider: ' + j.name + ' | ' + j.warning) : ('Added provider: ' + j.name), true);
+      setMsg('Added provider: ' + j.name + ' (' + Number(j.nodes||0) + ' nodes)', true);
       document.getElementById('mx-prov-name').value = '';
       document.getElementById('mx-prov-url').value = '';
       await loadProviders();

@@ -111,10 +111,6 @@ render_runtime_config() {
     --secret "${MIHOMO_SECRET}" \
     --sub-urls "${SUB_URLS:-}"
 
-  # ensure empty custom provider file exists
-  if [[ ! -f "${RUNTIME_ROOT}/providers/custom.yaml" ]]; then
-    printf 'proxies: []\n' > "${RUNTIME_ROOT}/providers/custom.yaml"
-  fi
   chmod 600 "${RUNTIME_ROOT}/config.yaml"
   mihomo -t -d "${RUNTIME_ROOT}" >/dev/null
 }
