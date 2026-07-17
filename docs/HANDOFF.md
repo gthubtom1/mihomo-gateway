@@ -18,7 +18,7 @@ Mihomo Gateway installs an authenticated public SOCKS5 gateway with a MetaCubeXD
 
 ## Verification
 
-- `python -m unittest discover -s tests -v`: 36 tests passing.
+- `python -m unittest discover -s tests -v`: 37 tests passing.
 - `python -m py_compile panel/app.py scripts/render-config.py`: passing.
 - `bash -n bootstrap.sh install.sh uninstall.sh scripts/common.sh scripts/mihomo-gateway`: passing with Git Bash.
 - Extracted injected JavaScript parses with Node.js.
@@ -27,14 +27,14 @@ Mihomo Gateway installs an authenticated public SOCKS5 gateway with a MetaCubeXD
 
 ## Pending
 
-- GitHub private repository `gthubtom1/mihomo-gateway` exists and `main` is pushed through commit `e6f86c6`.
-- Decide whether to make the repository public. Anonymous curl-pipe install cannot use the private raw URL.
-- Back up the live VPS config/provider directory before replacing files or rerunning the installer.
-- Deploy only when SSH/HTTP connectivity returns, then verify a real subscription import, node count, exact deletion, SOCKS create/delete, and authenticated egress.
-- Confirm the one-click command from a clean Linux environment after the pushed `bootstrap.sh` is available remotely.
+- GitHub repository `gthubtom1/mihomo-gateway` is public and `main` is deployed through commit `963dd83`.
+- The target VPS was backed up and installed through the public curl-pipe bootstrap. Existing Nginx and Docker services remained active.
+- Two local YAML files were normalized into static providers with 171 and 20 nodes. AUTO has 191 candidates and GPT has 60; neither automatic group selects `DIRECT` while providers exist.
+- Authenticated SOCKS egress uses an airport exit, temporary SOCKS create/delete passed, the public panel returned the injected UI, and a GPT-routed request reached the target HTTP service.
+- Replace the static providers with panel-managed subscription URLs when the operator has the original URLs; static YAML cannot update itself.
 - Configure HTTPS or restrict the panel network path before treating management credentials as protected in transit.
 - Pin/audit the Mihomo, MetaCubeXD, and repository refs for a reproducible release; defaults currently track upstream/latest branches for one-click updates.
 
 ## Next Session First Step
 
-Recheck the target VPS SSH and panel ports; the latest probes found both known VPS SSH ports unreachable and the target panel port timed out. Once reachable, back up first and run the live provider/SOCKS lifecycle verification before declaring deployment complete.
+Obtain the two original subscription URLs, add them in the panel, verify node counts, then delete the matching static providers so future airport changes update automatically.
