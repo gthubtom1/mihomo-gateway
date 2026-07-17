@@ -583,6 +583,8 @@ def attach_provider_to_groups(cfg, provider_name):
         if provider_name not in use:
             use.append(provider_name)
             g["use"] = use
+        if g.get("type") in {"url-test", "fallback"} and g.get("proxies") == ["DIRECT"]:
+            g["proxies"] = []
 
 
 def detach_provider_from_groups(cfg, provider_name):

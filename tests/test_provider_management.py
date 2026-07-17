@@ -163,6 +163,22 @@ class ProviderManagementTests(unittest.TestCase):
 
         self.assertNotIn("custom", gateway.load_cfg()["proxy-providers"])
 
+    def test_first_provider_removes_direct_from_automatic_groups(self):
+        cfg = gateway.load_cfg()
+        cfg["proxy-groups"] = [
+            {"name": "AUTO", "type": "url-test", "use": [], "proxies": ["DIRECT"]},
+            {"name": "GPT", "type": "url-test", "use": [], "proxies": ["DIRECT"]},
+            {"name": "故障转移", "type": "fallback", "use": [], "proxies": ["DIRECT"]},
+            {"name": "自定义", "type": "select", "use": [], "proxies": ["DIRECT"]},
+        ]
+        gateway.attach_provider_to_groups(cfg, "airport")
+
+        groups = {group["name"]: group for group in cfg["proxy-groups"]}
+        self.assertEqual([], groups["AUTO"]["proxies"])
+        self.assertEqual([], groups["GPT"]["proxies"])
+        self.assertEqual([], groups["故障转移"]["proxies"])
+        self.assertEqual(["DIRECT"], groups["自定义"]["proxies"])
+
     def test_orphan_id_cannot_delete_same_stem_configured_provider(self):
         cfg = gateway.load_cfg()
         cfg["proxy-providers"]["foo"] = {
