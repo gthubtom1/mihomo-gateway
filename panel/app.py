@@ -65,10 +65,19 @@ def _find_orphan_path(name):
         return None
     if not PROVIDERS_DIR.exists():
         return None
-    for path in PROVIDERS_DIR.glob("*.y*ml"):
+    for path in _provider_files():
         if path.stem == name and path.resolve().parent == PROVIDERS_DIR.resolve():
             return path
     return None
+
+
+def _provider_files():
+    if not PROVIDERS_DIR.exists():
+        return []
+    return sorted(
+        path for path in PROVIDERS_DIR.iterdir()
+        if path.is_file() and path.suffix.lower() in {".yaml", ".yml"}
+    )
 
 
 def _provider_path(name, provider=None):
@@ -153,7 +162,7 @@ def list_providers(cfg):
             "nodes": nodes,
         })
     if PROVIDERS_DIR.exists():
-        for path in sorted(PROVIDERS_DIR.glob("*.y*ml")):
+        for path in _provider_files():
             resolved = path.resolve()
             if resolved in configured_paths:
                 continue
@@ -326,7 +335,9 @@ def fetch_subscription(url, timeout=25):
         try:
             req = urllib.request.Request(url, headers=headers, method="GET")
             with urllib.request.urlopen(req, timeout=timeout) as r:
-                body = r.read(2 * 1024 * 1024)  # 2MB probe max for precheck
+                body = r.read(16 * 1024 * 1024 + 1)
+                if len(body) > 16 * 1024 * 1024:
+                    raise RuntimeError("subscription exceeds 16 MiB limit")
                 final = getattr(r, "geturl", lambda: url)()
                 status = getattr(r, "status", 200)
                 if body:
