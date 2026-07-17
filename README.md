@@ -20,7 +20,7 @@ One-click Mihomo (Clash.Meta) public SOCKS5 gateway for VPS, with MetaCubeXD pan
 ## One-click install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/gthubtom1/mihomo-gateway/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/gthubtom1/mihomo-gateway/main/bootstrap.sh | bash
 ```
 
 Or:
@@ -30,8 +30,6 @@ git clone https://github.com/gthubtom1/mihomo-gateway.git
 cd mihomo-gateway
 bash install.sh
 ```
-
-Replace `OWNER` with your GitHub username/org.
 
 ## Custom install
 
@@ -57,7 +55,7 @@ If asked for backend:
 
 ```text
 Backend: http://YOUR_VPS_IP:9090
-Secret:  (printed by installer / credentials file)
+Secret:  (stored in the root-only credentials file)
 ```
 
 Credentials:
@@ -65,6 +63,8 @@ Credentials:
 ```bash
 cat /root/mihomo-gateway/credentials.txt
 ```
+
+The installer does not print the Secret or SOCKS password to stdout. Run `mihomo-gateway credentials` as root when you need them.
 
 Left sidebar **SOCKS5**:
 
@@ -99,4 +99,3 @@ See [docs/SECURITY.md](docs/SECURITY.md).
 ## License
 
 MIT
-

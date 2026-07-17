@@ -8,6 +8,7 @@ GATEWAY_NAME="mihomo-gateway"
 INSTALL_ROOT="/opt/${GATEWAY_NAME}"
 RUNTIME_ROOT="/etc/mihomo"
 STATE_ROOT="/root/${GATEWAY_NAME}"
+BACKUP_ROOT="${BACKUP_ROOT:-/root/mihomo-backups}"
 CRED_FILE="${STATE_ROOT}/credentials.txt"
 ENV_FILE="${STATE_ROOT}/env"
 PANEL_API_PORT_DEFAULT=9092
@@ -35,7 +36,7 @@ detect_public_ip() {
 }
 
 prepare_dirs() {
-  mkdir -p "${INSTALL_ROOT}" "${RUNTIME_ROOT}/providers" "${RUNTIME_ROOT}/ui" "${STATE_ROOT}" /root/mihomo-backups
+  mkdir -p "${INSTALL_ROOT}" "${RUNTIME_ROOT}/providers" "${RUNTIME_ROOT}/ui" "${STATE_ROOT}" "${BACKUP_ROOT}"
 }
 
 install_dependencies() {
@@ -87,20 +88,43 @@ generate_secrets() {
   SOCKS_PASS="${SOCKS_PASS:-$(rand_secret)}"
   MIHOMO_SECRET="${MIHOMO_SECRET:-$(rand_secret)}"
 
-  cat > "${ENV_FILE}" <<EOF
-PUBLIC_IP=${PUBLIC_IP}
-PANEL_PORT=${PANEL_PORT}
-PANEL_API_PORT=${PANEL_API_PORT}
-SOCKS_PORT=${SOCKS_PORT}
-SOCKS_USER=${SOCKS_USER}
-SOCKS_PASS=${SOCKS_PASS}
-MIHOMO_SECRET=${MIHOMO_SECRET}
-EOF
+  {
+    printf 'PUBLIC_IP=%q\n' "${PUBLIC_IP}"
+    printf 'PANEL_PORT=%q\n' "${PANEL_PORT}"
+    printf 'PANEL_API_PORT=%q\n' "${PANEL_API_PORT}"
+    printf 'SOCKS_PORT=%q\n' "${SOCKS_PORT}"
+    printf 'SOCKS_USER=%q\n' "${SOCKS_USER}"
+    printf 'SOCKS_PASS=%q\n' "${SOCKS_PASS}"
+    printf 'MIHOMO_SECRET=%q\n' "${MIHOMO_SECRET}"
+  } > "${ENV_FILE}"
   chmod 600 "${ENV_FILE}"
+}
+
+prepare_provider_storage() {
+  local provider_dir="${RUNTIME_ROOT}/providers"
+  mkdir -p "${provider_dir}" "${BACKUP_ROOT}"
+
+  local files=()
+  shopt -s nullglob
+  files=("${provider_dir}"/*.yaml "${provider_dir}"/*.yml "${provider_dir}"/*.YAML "${provider_dir}"/*.YML)
+  shopt -u nullglob
+  [[ "${#files[@]}" -gt 0 || -f "${RUNTIME_ROOT}/config.yaml" ]] || return 0
+
+  local backup_dir="${BACKUP_ROOT}/reinstall-$(date +%Y%m%d-%H%M%S)-$$"
+  mkdir -p "${backup_dir}/providers"
+  if [[ -f "${RUNTIME_ROOT}/config.yaml" ]]; then
+    cp -a -- "${RUNTIME_ROOT}/config.yaml" "${backup_dir}/config.yaml"
+  fi
+  if [[ "${#files[@]}" -gt 0 ]]; then
+    cp -a -- "${files[@]}" "${backup_dir}/providers/"
+    rm -f -- "${files[@]}"
+  fi
+  ok "backed up runtime config and cleared ${#files[@]} stale provider file(s)"
 }
 
 render_runtime_config() {
   log "rendering mihomo config"
+  prepare_provider_storage
   python3 "${ROOT_DIR}/scripts/render-config.py" \
     --template "${ROOT_DIR}/config/config.template.yaml" \
     --output "${RUNTIME_ROOT}/config.yaml" \
@@ -113,6 +137,26 @@ render_runtime_config() {
 
   chmod 600 "${RUNTIME_ROOT}/config.yaml"
   mihomo -t -d "${RUNTIME_ROOT}" >/dev/null
+}
+
+import_initial_subscriptions() {
+  local raw="${SUB_URLS:-}"
+  [[ -n "${raw}" ]] || return 0
+
+  local root records record name url
+  root="${ROOT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+  if ! records="$(python3 "${root}/scripts/render-config.py" --emit-sub-urls "${raw}")"; then
+    die "failed to parse initial subscriptions"
+  fi
+  while IFS= read -r record; do
+    [[ -n "${record}" ]] || continue
+    name="$(printf '%s' "${record}" | jq -r '.name')"
+    url="$(printf '%s' "${record}" | jq -r '.url')"
+    log "importing initial subscription: ${name}"
+    if ! mihomo-gateway provider add "${name}" "${url}" 3600 >/dev/null; then
+      die "failed to import initial subscription: ${name}"
+    fi
+  done <<< "${records}"
 }
 
 install_panel_api() {
@@ -168,13 +212,12 @@ install_nginx_site() {
       -e "s/__PANEL_API_PORT__/${PANEL_API_PORT}/g" \
       "${ROOT_DIR}/panel/nginx.conf.template" > /etc/nginx/sites-available/mihomo-gateway
   cat > /etc/nginx/conf.d/mihomo-upgrade-map.conf <<'EOF'
-map $http_upgrade $connection_upgrade {
+map $http_upgrade $mihomo_connection_upgrade {
     default upgrade;
     '' close;
 }
 EOF
   ln -sfn /etc/nginx/sites-available/mihomo-gateway /etc/nginx/sites-enabled/mihomo-gateway
-  rm -f /etc/nginx/sites-enabled/default
   nginx -t
 }
 
@@ -200,9 +243,6 @@ WantedBy=multi-user.target
 EOF
 
   sed -e "s|__INSTALL_ROOT__|${INSTALL_ROOT}|g" \
-      -e "s|__PANEL_API_PORT__|${PANEL_API_PORT}|g" \
-      -e "s|__MIHOMO_SECRET__|${MIHOMO_SECRET}|g" \
-      -e "s|__PUBLIC_IP__|${PUBLIC_IP}|g" \
       "${ROOT_DIR}/panel/mihomo-gateway-api.service" > /etc/systemd/system/mihomo-gateway-api.service
 
   systemctl daemon-reload
@@ -227,8 +267,6 @@ enable_firewall() {
 
 start_services() {
   log "starting services"
-  # ensure mihomo controller port free
-  fuser -k "${PANEL_PORT}/tcp" 2>/dev/null || true
   systemctl restart mihomo
   sleep 1
   systemctl restart mihomo-gateway-api
@@ -256,10 +294,9 @@ EOF
   echo
   ok "install complete"
   echo "Panel : http://${PUBLIC_IP}:${PANEL_PORT}/"
-  echo "Secret: ${MIHOMO_SECRET}"
-  echo "SOCKS : socks5://${SOCKS_USER}:${SOCKS_PASS}@${PUBLIC_IP}:${SOCKS_PORT}"
   echo "Creds : ${CRED_FILE}"
   echo
-  echo "Open panel, set backend to the panel URL and paste Secret if prompted."
+  echo "Run 'mihomo-gateway credentials' as root to view the Secret and SOCKS URL."
+  echo "Open panel, set backend to the panel URL and paste the Secret if prompted."
   echo "Use left sidebar SOCKS5 to manage ports and subscription URLs."
 }

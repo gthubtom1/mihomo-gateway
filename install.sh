@@ -17,4 +17,5 @@ install_nginx_site
 install_systemd_units
 enable_firewall
 start_services
+import_initial_subscriptions
 print_summary

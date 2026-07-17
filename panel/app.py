@@ -1,16 +1,23 @@
 #!/usr/bin/env python3
 """Local management API for SOCKS listeners and subscription providers."""
+import base64
+import http.client
+import ipaddress
 import json
 import os
 import re
 import secrets
+import socket
+import ssl
 import subprocess
+import tempfile
+import threading
 import time
 import urllib.request
 from html import unescape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse, urlsplit
 
 import yaml
 
@@ -24,6 +31,8 @@ LISTEN_PORT = int(os.environ.get("PANEL_API_PORT", "9092"))
 PROTECTED_PROVIDERS = set(
     x.strip() for x in os.environ.get("PROTECTED_PROVIDERS", "").split(",") if x.strip()
 )
+MUTATION_LOCK = threading.RLock()
+MAX_API_BODY = 64 * 1024
 
 
 def load_cfg():
@@ -41,10 +50,17 @@ def save_cfg(cfg):
 
 def _atomic_write(path, raw):
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    tmp.write_bytes(raw)
-    os.chmod(tmp, 0o600)
-    tmp.replace(path)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(raw)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def _restore_config(raw):
@@ -58,7 +74,7 @@ def _safe_provider_path(name):
 
 
 def _find_orphan_path(name):
-    name = (name or "").strip()
+    name = "" if name is None else str(name)
     if not name or len(name) > 128 or name in {".", ".."}:
         return None
     if "/" in name or "\\" in name:
@@ -69,6 +85,228 @@ def _find_orphan_path(name):
         if path.stem == name and path.resolve().parent == PROVIDERS_DIR.resolve():
             return path
     return None
+
+
+def _find_orphan_file(filename):
+    filename = "" if filename is None else str(filename)
+    if not filename or len(filename) > 255 or filename in {".", ".."}:
+        return None
+    if "/" in filename or "\\" in filename:
+        return None
+    if Path(filename).suffix.lower() not in {".yaml", ".yml"}:
+        return None
+    for path in _provider_files():
+        if path.name == filename and path.resolve().parent == PROVIDERS_DIR.resolve():
+            return path
+    return None
+
+
+def _resource_id(kind, value):
+    token = base64.urlsafe_b64encode(str(value).encode("utf-8")).decode("ascii").rstrip("=")
+    return f"{kind}:{token}"
+
+
+def _decode_resource_id(value):
+    if not value or ":" not in value:
+        raise RuntimeError("invalid provider id")
+    kind, token = value.split(":", 1)
+    if kind not in {"provider", "orphan"} or not token:
+        raise RuntimeError("invalid provider id")
+    try:
+        padding = "=" * (-len(token) % 4)
+        decoded = base64.urlsafe_b64decode(token + padding).decode("utf-8")
+    except Exception as e:
+        raise RuntimeError("invalid provider id") from e
+    return kind, decoded
+
+
+def _display_url(raw):
+    try:
+        parsed = urlsplit(raw or "")
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            return ""
+        host = parsed.hostname
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        if parsed.port:
+            host = f"{host}:{parsed.port}"
+        return f"{parsed.scheme}://{host}/..."
+    except Exception:
+        return ""
+
+
+def _resolve_safe_subscription_url(raw):
+    if not isinstance(raw, str) or not raw or len(raw) > 8192:
+        raise RuntimeError("invalid subscription URL")
+    if any(char in raw for char in "\r\n\t\\"):
+        raise RuntimeError("invalid subscription URL")
+    try:
+        parsed = urlsplit(raw)
+        port = parsed.port
+    except ValueError as e:
+        raise RuntimeError(f"invalid subscription URL: {e}") from e
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise RuntimeError("subscription URL must use http or https")
+    if parsed.username is not None or parsed.password is not None:
+        raise RuntimeError("subscription URL must not contain user information")
+
+    service_port = port or (443 if parsed.scheme == "https" else 80)
+    try:
+        addresses = socket.getaddrinfo(
+            parsed.hostname,
+            service_port,
+            type=socket.SOCK_STREAM,
+        )
+    except OSError as e:
+        raise RuntimeError(f"cannot resolve subscription host: {e}") from e
+    if not addresses:
+        raise RuntimeError("cannot resolve subscription host")
+
+    public_ips = []
+    for address in addresses:
+        raw_ip = address[4][0].split("%", 1)[0]
+        try:
+            ip = ipaddress.ip_address(raw_ip)
+        except ValueError as e:
+            raise RuntimeError(f"invalid subscription host address: {raw_ip}") from e
+        if not ip.is_global:
+            raise RuntimeError("subscription URL must resolve only to a public address")
+        if raw_ip not in public_ips:
+            public_ips.append(raw_ip)
+    return parsed, public_ips
+
+
+def _assert_safe_subscription_url(raw):
+    _resolve_safe_subscription_url(raw)
+    return raw
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, address, port, server_hostname, timeout):
+        super().__init__(
+            address,
+            port,
+            timeout=timeout,
+            context=ssl.create_default_context(),
+        )
+        self._tls_server_hostname = server_hostname
+
+    def connect(self):
+        self.sock = self._create_connection(
+            (self.host, self.port),
+            self.timeout,
+            self.source_address,
+        )
+        if self._tunnel_host:
+            self._tunnel()
+        self.sock = self._context.wrap_socket(
+            self.sock,
+            server_hostname=self._tls_server_hostname,
+        )
+
+
+class _SubscriptionResponse:
+    def __init__(self, response, connection, final_url):
+        self._response = response
+        self._connection = connection
+        self._final_url = final_url
+        self.status = response.status
+
+    def read(self, limit=-1):
+        return self._response.read(limit)
+
+    def getheader(self, name, default=None):
+        return self._response.getheader(name, default)
+
+    def geturl(self):
+        return self._final_url
+
+    def close(self):
+        try:
+            self._response.close()
+        finally:
+            self._connection.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        self.close()
+        return False
+
+
+def _open_pinned_once(url, headers, timeout):
+    parsed, addresses = _resolve_safe_subscription_url(url)
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    target = parsed.path or "/"
+    if parsed.query:
+        target += f"?{parsed.query}"
+
+    host = parsed.hostname
+    host_header = f"[{host}]" if ":" in host else host
+    default_port = 443 if parsed.scheme == "https" else 80
+    if parsed.port and parsed.port != default_port:
+        host_header = f"{host_header}:{parsed.port}"
+
+    last_error = None
+    for address in addresses:
+        connection = None
+        try:
+            if parsed.scheme == "https":
+                connection = _PinnedHTTPSConnection(
+                    address,
+                    port,
+                    server_hostname=host,
+                    timeout=timeout,
+                )
+            else:
+                connection = http.client.HTTPConnection(address, port, timeout=timeout)
+            connection.putrequest(
+                "GET",
+                target,
+                skip_host=True,
+                skip_accept_encoding=True,
+            )
+            connection.putheader("Host", host_header)
+            for key, value in headers.items():
+                if key.lower() != "host":
+                    connection.putheader(key, value)
+            connection.endheaders()
+            response = connection.getresponse()
+            return _SubscriptionResponse(response, connection, url)
+        except Exception as e:
+            last_error = e
+            if connection is not None:
+                connection.close()
+    raise RuntimeError(f"subscription connection failed: {last_error}")
+
+
+def _open_subscription(req, timeout):
+    url = req.full_url
+    headers = dict(req.header_items())
+    redirect_statuses = {301, 302, 303, 307, 308}
+    for redirect_count in range(6):
+        response = _open_pinned_once(url, headers, timeout)
+        if response.status in redirect_statuses:
+            location = response.getheader("Location")
+            if not location:
+                response.close()
+                raise RuntimeError("subscription redirect has no Location header")
+            if redirect_count >= 5:
+                response.close()
+                raise RuntimeError("subscription has too many redirects")
+            next_url = urljoin(url, location)
+            response.close()
+            _assert_safe_subscription_url(next_url)
+            url = next_url
+            continue
+        if response.status >= 400:
+            status = response.status
+            response.close()
+            raise RuntimeError(f"HTTP Error {status}")
+        response._final_url = url
+        return response
+    raise RuntimeError("subscription has too many redirects")
 
 
 def _provider_files():
@@ -152,9 +390,10 @@ def list_providers(cfg):
             exists = False
             nodes = 0
         rows.append({
+            "id": _resource_id("provider", name),
             "name": name,
             "type": p.get("type"),
-            "url": p.get("url") or "",
+            "display_url": _display_url(p.get("url")),
             "path": p.get("path") or "",
             "interval": p.get("interval"),
             "protected": name in PROTECTED_PROVIDERS,
@@ -167,9 +406,10 @@ def list_providers(cfg):
             if resolved in configured_paths:
                 continue
             rows.append({
+                "id": _resource_id("orphan", path.name),
                 "name": path.stem,
                 "type": "orphan",
-                "url": "",
+                "display_url": "",
                 "path": str(path),
                 "interval": None,
                 "protected": False,
@@ -199,22 +439,40 @@ def validate_and_restart():
     raise RuntimeError(f"mihomo did not become ready after restart: {last_error}")
 
 
-def ufw_allow(port):
+def _ufw_status():
     try:
-        st = subprocess.check_output(["ufw", "status"], text=True)
-        if "Status: active" in st:
-            subprocess.call(["ufw", "allow", f"{port}/tcp"])
-    except Exception:
-        pass
+        return subprocess.check_output(["ufw", "status"], text=True)
+    except FileNotFoundError:
+        return ""
+
+
+def _ufw_has_rule(status, port):
+    prefix = re.compile(rf"^\s*{re.escape(str(port))}/tcp(?:\s|\()")
+    return any(prefix.search(line) and re.search(r"\bALLOW\b", line) for line in status.splitlines())
+
+
+def ufw_allow(port):
+    status = _ufw_status()
+    if "Status: active" not in status or _ufw_has_rule(status, port):
+        return False
+    subprocess.check_call(
+        ["ufw", "allow", f"{port}/tcp"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return True
 
 
 def ufw_delete(port):
-    try:
-        st = subprocess.check_output(["ufw", "status"], text=True)
-        if "Status: active" in st:
-            subprocess.call(["ufw", "--force", "delete", "allow", f"{port}/tcp"])
-    except Exception:
-        pass
+    status = _ufw_status()
+    if "Status: active" not in status or not _ufw_has_rule(status, port):
+        return False
+    subprocess.check_call(
+        ["ufw", "--force", "delete", "allow", f"{port}/tcp"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return True
 
 
 def default_auth(listeners):
@@ -226,68 +484,95 @@ def default_auth(listeners):
 
 
 def add_socks(port, group, name=None, user=None, password=None):
-    cfg = load_cfg()
-    port = int(port)
-    if port < 1024 or port > 65535:
-        raise RuntimeError("port must be 1024-65535")
-    if group not in group_names(cfg):
-        raise RuntimeError(f"group not found: {group}")
-    listeners = cfg.setdefault("listeners", [])
-    name = name or f"socks-{port}"
-    if not re.fullmatch(r"[A-Za-z0-9._-]{1,40}", name):
-        raise RuntimeError("invalid name")
-    for lis in listeners:
-        if lis.get("type") == "socks" and int(lis.get("port") or 0) == port:
-            raise RuntimeError(f"port exists: {port}")
-        if lis.get("name") == name:
-            raise RuntimeError(f"name exists: {name}")
-    duser, dpw = default_auth(listeners)
-    user = user or duser
-    password = password or dpw
-    listeners.append({
-        "name": name,
-        "type": "socks",
-        "port": port,
-        "listen": "0.0.0.0",
-        "users": [{"username": user, "password": password}],
-        "proxy": group,
-    })
-    save_cfg(cfg)
-    validate_and_restart()
-    ufw_allow(port)
-    return {
-        "name": name,
-        "port": port,
-        "group": group,
-        "user": user,
-        "password": password,
-        "url": f"socks5://{user}:{password}@{HOST_PUBLIC}:{port}",
-    }
+    with MUTATION_LOCK:
+        cfg = load_cfg()
+        original_config = CONFIG.read_bytes()
+        port = int(port)
+        if port < 1024 or port > 65535:
+            raise RuntimeError("port must be 1024-65535")
+        if group not in group_names(cfg):
+            raise RuntimeError(f"group not found: {group}")
+        listeners = cfg.setdefault("listeners", [])
+        name = name or f"socks-{port}"
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,40}", name):
+            raise RuntimeError("invalid name")
+        for lis in listeners:
+            if lis.get("type") == "socks" and int(lis.get("port") or 0) == port:
+                raise RuntimeError(f"port exists: {port}")
+            if lis.get("name") == name:
+                raise RuntimeError(f"name exists: {name}")
+        duser, dpw = default_auth(listeners)
+        user = user or duser
+        password = password or dpw
+        listeners.append({
+            "name": name,
+            "type": "socks",
+            "port": port,
+            "listen": "0.0.0.0",
+            "users": [{"username": user, "password": password}],
+            "proxy": group,
+        })
+        firewall_changed = False
+        try:
+            save_cfg(cfg)
+            validate_and_restart()
+            firewall_changed = ufw_allow(port)
+        except Exception:
+            _restore_config(original_config)
+            try:
+                validate_and_restart()
+                if firewall_changed:
+                    ufw_delete(port)
+            except Exception:
+                pass
+            raise
+        return {
+            "name": name,
+            "port": port,
+            "group": group,
+            "user": user,
+            "password": password,
+            "url": f"socks5://{user}:{password}@{HOST_PUBLIC}:{port}",
+        }
 
 
 def del_socks(port=None, name=None):
-    cfg = load_cfg()
-    listeners = cfg.get("listeners") or []
-    kept, removed = [], None
-    for lis in listeners:
-        hit = False
-        if lis.get("type") == "socks":
-            if port is not None and int(lis.get("port") or 0) == int(port):
-                hit = True
-            if name and lis.get("name") == name:
-                hit = True
-        if hit:
-            removed = lis
-        else:
-            kept.append(lis)
-    if not removed:
-        raise RuntimeError("not found")
-    cfg["listeners"] = kept
-    save_cfg(cfg)
-    validate_and_restart()
-    if removed.get("port") is not None:
-        ufw_delete(int(removed["port"]))
-    return removed
+    with MUTATION_LOCK:
+        cfg = load_cfg()
+        original_config = CONFIG.read_bytes()
+        listeners = cfg.get("listeners") or []
+        kept, removed = [], None
+        for lis in listeners:
+            hit = False
+            if lis.get("type") == "socks":
+                if port is not None and int(lis.get("port") or 0) == int(port):
+                    hit = True
+                if name and lis.get("name") == name:
+                    hit = True
+            if hit:
+                removed = lis
+            else:
+                kept.append(lis)
+        if not removed:
+            raise RuntimeError("not found")
+        cfg["listeners"] = kept
+        removed_port = int(removed["port"]) if removed.get("port") is not None else None
+        firewall_changed = False
+        try:
+            save_cfg(cfg)
+            validate_and_restart()
+            if removed_port is not None:
+                firewall_changed = ufw_delete(removed_port)
+        except Exception:
+            _restore_config(original_config)
+            try:
+                validate_and_restart()
+                if removed_port is not None and firewall_changed:
+                    ufw_allow(removed_port)
+            except Exception:
+                pass
+            raise
+        return removed
 
 
 def attach_provider_to_groups(cfg, provider_name):
@@ -305,6 +590,8 @@ def detach_provider_from_groups(cfg, provider_name):
         use = g.get("use")
         if isinstance(use, list) and provider_name in use:
             g["use"] = [x for x in use if x != provider_name]
+            if not g["use"] and not g.get("proxies"):
+                g["proxies"] = ["DIRECT"]
 
 
 def fetch_subscription(url, timeout=25):
@@ -322,6 +609,7 @@ def fetch_subscription(url, timeout=25):
         # browser fallback for strict CDNs
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     ]
+    _assert_safe_subscription_url(url)
     last_err = None
     for ua in uas:
         headers = {
@@ -334,15 +622,16 @@ def fetch_subscription(url, timeout=25):
         }
         try:
             req = urllib.request.Request(url, headers=headers, method="GET")
-            with urllib.request.urlopen(req, timeout=timeout) as r:
+            with _open_subscription(req, timeout=timeout) as r:
+                final = getattr(r, "geturl", lambda: url)()
                 body = r.read(16 * 1024 * 1024 + 1)
                 if len(body) > 16 * 1024 * 1024:
                     raise RuntimeError("subscription exceeds 16 MiB limit")
-                final = getattr(r, "geturl", lambda: url)()
                 status = getattr(r, "status", 200)
-                if body:
-                    return body, final, status, ua
-                last_err = RuntimeError("empty subscription body")
+                if not body:
+                    raise RuntimeError("empty subscription body")
+                normalized, node_count = normalize_subscription(body)
+                return normalized, node_count, final, status, ua
         except Exception as e:
             last_err = e
             continue
@@ -377,7 +666,6 @@ def normalize_subscription(body):
 
 
 def add_provider(name, url, interval=3600):
-    cfg = load_cfg()
     name = (name or "").strip()
     url = unescape((url or "").strip())
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", name):
@@ -387,99 +675,113 @@ def add_provider(name, url, interval=3600):
     if not (url.startswith("http://") or url.startswith("https://")):
         raise RuntimeError("url must start with http:// or https://")
     interval = max(300, int(interval or 3600))
-    providers = cfg.setdefault("proxy-providers", {})
-    if name in providers:
-        raise RuntimeError(f"provider exists: {name}")
-    cache_path = _safe_provider_path(name)
-    if cache_path.exists():
-        raise RuntimeError(
-            f"orphan provider file exists: {cache_path.name}; delete it first"
-        )
     try:
-        body, final_url, _status, user_agent = fetch_subscription(url)
-        if final_url and final_url != url:
-            url = final_url
-        normalized, node_count = normalize_subscription(body)
+        normalized, node_count, _final_url, _status, user_agent = fetch_subscription(url)
     except Exception as e:
         raise RuntimeError(f"fetch subscription failed: {e}")
-    original_config = CONFIG.read_bytes()
-    providers[name] = {
-        "type": "http",
-        "url": url,
-        "interval": interval,
-        "path": f"./providers/{name}.yaml",
-        "header": {"User-Agent": [user_agent]},
-        "health-check": {
-            "enable": True,
-            "interval": 600,
-            "url": "https://www.gstatic.com/generate_204",
-        },
-    }
-    attach_provider_to_groups(cfg, name)
-    try:
-        _atomic_write(cache_path, normalized)
-        save_cfg(cfg)
-        validate_and_restart()
-    except Exception:
-        _restore_config(original_config)
-        cache_path.unlink(missing_ok=True)
+    with MUTATION_LOCK:
+        cfg = load_cfg()
+        providers = cfg.setdefault("proxy-providers", {})
+        if name in providers:
+            raise RuntimeError(f"provider exists: {name}")
+        cache_path = _safe_provider_path(name)
+        if cache_path.exists():
+            raise RuntimeError(
+                f"orphan provider file exists: {cache_path.name}; delete it first"
+            )
+        original_config = CONFIG.read_bytes()
+        providers[name] = {
+            "type": "http",
+            "url": url,
+            "interval": interval,
+            "path": f"./providers/{name}.yaml",
+            "header": {"User-Agent": [user_agent]},
+            "health-check": {
+                "enable": True,
+                "interval": 600,
+                "url": "https://www.gstatic.com/generate_204",
+            },
+        }
+        attach_provider_to_groups(cfg, name)
         try:
+            _atomic_write(cache_path, normalized)
+            save_cfg(cfg)
             validate_and_restart()
         except Exception:
-            pass
-        raise
-    return {
-        "name": name,
-        "type": "http",
-        "url": url,
-        "interval": interval,
-        "path": f"./providers/{name}.yaml",
-        "nodes": node_count,
-    }
-
-
-def del_provider(name):
-    cfg = load_cfg()
-    name = (name or "").strip()
-    if name in PROTECTED_PROVIDERS:
-        raise RuntimeError(f"protected provider cannot delete: {name}")
-    providers = cfg.get("proxy-providers") or {}
-    if name not in providers:
-        orphan = _find_orphan_path(name)
-        if orphan is None:
-            raise RuntimeError("provider not found")
-        backup = _backup_provider_file(orphan)
-        orphan.unlink()
+            _restore_config(original_config)
+            cache_path.unlink(missing_ok=True)
+            try:
+                validate_and_restart()
+            except Exception:
+                pass
+            raise
         return {
             "name": name,
+            "type": "http",
+            "display_url": _display_url(url),
+            "interval": interval,
+            "path": f"./providers/{name}.yaml",
+            "nodes": node_count,
+        }
+
+
+def del_provider(name=None, provider_id=None):
+    with MUTATION_LOCK:
+        cfg = load_cfg()
+        providers = cfg.get("proxy-providers") or {}
+        kind = None
+        target = None
+        if provider_id:
+            kind, target = _decode_resource_id(provider_id)
+        else:
+            raw_name = "" if name is None else str(name)
+            target = raw_name if raw_name in providers else raw_name.strip()
+            kind = "provider" if target in providers else "orphan"
+
+        if kind == "orphan":
+            orphan = _find_orphan_file(target) if provider_id else _find_orphan_path(target)
+            if orphan is None:
+                raise RuntimeError("provider not found")
+            backup = _backup_provider_file(orphan)
+            orphan.unlink()
+            return {
+                "id": _resource_id("orphan", orphan.name),
+                "name": orphan.stem,
+                "deleted": True,
+                "orphan": True,
+                "backup": str(backup) if backup else "",
+            }
+
+        name = target
+        if name in PROTECTED_PROVIDERS:
+            raise RuntimeError(f"protected provider cannot delete: {name}")
+        if name not in providers:
+            raise RuntimeError("provider not found")
+        original_config = CONFIG.read_bytes()
+        provider = providers[name]
+        path = _provider_path(name, provider)
+        backup = _backup_provider_file(path)
+        del providers[name]
+        cfg["proxy-providers"] = providers
+        detach_provider_from_groups(cfg, name)
+        try:
+            save_cfg(cfg)
+            validate_and_restart()
+            path.unlink(missing_ok=True)
+        except Exception:
+            _restore_config(original_config)
+            try:
+                validate_and_restart()
+            except Exception:
+                pass
+            raise
+        return {
+            "id": _resource_id("provider", name),
+            "name": name,
             "deleted": True,
-            "orphan": True,
+            "orphan": False,
             "backup": str(backup) if backup else "",
         }
-    original_config = CONFIG.read_bytes()
-    provider = providers[name]
-    path = _provider_path(name, provider)
-    del providers[name]
-    cfg["proxy-providers"] = providers
-    detach_provider_from_groups(cfg, name)
-    try:
-        save_cfg(cfg)
-        validate_and_restart()
-    except Exception:
-        _restore_config(original_config)
-        try:
-            validate_and_restart()
-        except Exception:
-            pass
-        raise
-    backup = _backup_provider_file(path)
-    path.unlink(missing_ok=True)
-    return {
-        "name": name,
-        "deleted": True,
-        "orphan": False,
-        "backup": str(backup) if backup else "",
-    }
 
 
 class H(BaseHTTPRequestHandler):
@@ -493,6 +795,8 @@ class H(BaseHTTPRequestHandler):
 
     def _body(self):
         n = int(self.headers.get("Content-Length") or 0)
+        if n < 0 or n > MAX_API_BODY:
+            raise RuntimeError("request body too large")
         return json.loads(self.rfile.read(n).decode("utf-8")) if n else {}
 
     def _auth_ok(self):
@@ -500,8 +804,8 @@ class H(BaseHTTPRequestHandler):
             return False
         auth = self.headers.get("Authorization") or ""
         if auth.startswith("Bearer "):
-            return auth[7:].strip() == MIHOMO_SECRET
-        return (self.headers.get("X-Secret") or "") == MIHOMO_SECRET
+            return secrets.compare_digest(auth[7:].strip(), MIHOMO_SECRET)
+        return secrets.compare_digest(self.headers.get("X-Secret") or "", MIHOMO_SECRET)
 
     def do_GET(self):
         u = urlparse(self.path)
@@ -547,7 +851,10 @@ class H(BaseHTTPRequestHandler):
                 removed = del_socks(port=qs.get("port", [None])[0], name=qs.get("name", [None])[0])
                 return self._json(200, {"ok": True, "removed": removed.get("name"), "port": removed.get("port")})
             if u.path == "/panel-api/providers":
-                return self._json(200, del_provider(qs.get("name", [None])[0]))
+                return self._json(200, del_provider(
+                    name=qs.get("name", [None])[0],
+                    provider_id=qs.get("id", [None])[0],
+                ))
             return self._json(404, {"error": "not found"})
         except Exception as e:
             return self._json(400, {"error": str(e)})

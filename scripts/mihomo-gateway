@@ -14,6 +14,22 @@ need_cmd python3
 need_cmd systemctl
 need_cmd curl
 
+json_payload() {
+  python3 - "$@" <<'PY'
+import json
+import sys
+
+kind = sys.argv[1]
+if kind == "socks":
+    payload = {"port": int(sys.argv[2]), "group": sys.argv[3]}
+elif kind == "provider":
+    payload = {"name": sys.argv[2], "url": sys.argv[3], "interval": int(sys.argv[4])}
+else:
+    raise SystemExit("unknown payload type")
+print(json.dumps(payload, ensure_ascii=False))
+PY
+}
+
 api() {
   local method="$1"; shift
   local path="$1"; shift
@@ -40,7 +56,8 @@ case "${cmd}" in
       add)
         port="${1:-}"; group="${2:-PROXY}"
         [[ -n "${port}" ]] || { echo "usage: mihomo-gateway socks add <port> [group]"; exit 1; }
-        api POST /panel-api/socks -d "{\"port\":${port},\"group\":\"${group}\"}" | python3 -m json.tool
+        payload="$(json_payload socks "${port}" "${group}")"
+        api POST /panel-api/socks -d "${payload}" | python3 -m json.tool
         ;;
       del)
         port="${1:-}"
@@ -57,7 +74,8 @@ case "${cmd}" in
       add)
         name="${1:-}"; url="${2:-}"; interval="${3:-3600}"
         [[ -n "${name}" && -n "${url}" ]] || { echo "usage: mihomo-gateway provider add <name> <url> [interval]"; exit 1; }
-        api POST /panel-api/providers -d "{\"name\":\"${name}\",\"url\":\"${url}\",\"interval\":${interval}}" | python3 -m json.tool
+        payload="$(json_payload provider "${name}" "${url}" "${interval}")"
+        api POST /panel-api/providers -d "${payload}" | python3 -m json.tool
         ;;
       del)
         name="${1:-}"

@@ -220,22 +220,78 @@ a.nav-link.mx-socks-item{cursor:pointer}
       const data = await api('/panel-api/socks');
       const sel = document.getElementById('mx-group');
       const cur = sel.value;
-      sel.innerHTML = (data.groups || []).map(g => `<option value="${g}">${g}</option>`).join('');
+      sel.replaceChildren();
+      (data.groups || []).forEach(g => {
+        const option = document.createElement('option');
+        option.value = String(g);
+        option.textContent = String(g);
+        sel.appendChild(option);
+      });
       if (cur) sel.value = cur;
       const tb = document.getElementById('mx-tbody');
       const rows = data.socks || [];
-      tb.innerHTML = rows.length ? rows.map(s => `
-        <tr>
-          <td><span class="chip">${s.name||''}</span></td>
-          <td class="mono">${s.port}</td>
-          <td><span class="chip">${s.group||''}</span></td>
-          <td class="mono">${s.user}<br>${s.password}</td>
-          <td><div class="mono">${s.url}</div>
-            <button class="btn2" style="margin-top:6px;padding:5px 8px;font-size:12px" data-url="${String(s.url).replaceAll('"','&quot;')}">Copy</button></td>
-          <td><button class="btn-danger" data-port="${s.port}">Delete</button></td>
-        </tr>`).join('') : `<tr><td colspan="6" style="opacity:.6;text-align:center;padding:24px">Empty</td></tr>`;
-      tb.querySelectorAll('button[data-url]').forEach(b => b.onclick = () => navigator.clipboard.writeText(b.getAttribute('data-url')));
-      tb.querySelectorAll('button[data-port]').forEach(b => b.onclick = () => delSocks(Number(b.getAttribute('data-port'))));
+      tb.replaceChildren();
+      if (!rows.length){
+        const row = document.createElement('tr');
+        const cell = document.createElement('td');
+        cell.colSpan = 6;
+        cell.style.opacity = '.6';
+        cell.style.textAlign = 'center';
+        cell.style.padding = '24px';
+        cell.textContent = 'Empty';
+        row.appendChild(cell);
+        tb.appendChild(row);
+      }
+      rows.forEach(s => {
+        const row = document.createElement('tr');
+        const addCell = (text, className) => {
+          const cell = document.createElement('td');
+          if (className) cell.className = className;
+          cell.textContent = String(text);
+          row.appendChild(cell);
+          return cell;
+        };
+        const addChip = (cell, text) => {
+          const chip = document.createElement('span');
+          chip.className = 'chip';
+          chip.textContent = String(text);
+          cell.appendChild(chip);
+        };
+
+        addChip(addCell('', ''), s.name || '');
+        addCell(s.port || '', 'mono');
+        addChip(addCell('', ''), s.group || '');
+
+        const authCell = addCell('', 'mono');
+        authCell.appendChild(document.createTextNode(String(s.user || '')));
+        authCell.appendChild(document.createElement('br'));
+        authCell.appendChild(document.createTextNode(String(s.password || '')));
+
+        const url = String(s.url || '');
+        const urlCell = addCell('', '');
+        const urlText = document.createElement('div');
+        urlText.className = 'mono';
+        urlText.textContent = url;
+        urlCell.appendChild(urlText);
+        const copyButton = document.createElement('button');
+        copyButton.className = 'btn2';
+        copyButton.type = 'button';
+        copyButton.style.marginTop = '6px';
+        copyButton.style.padding = '5px 8px';
+        copyButton.style.fontSize = '12px';
+        copyButton.textContent = 'Copy';
+        copyButton.onclick = () => navigator.clipboard.writeText(url);
+        urlCell.appendChild(copyButton);
+
+        const actionCell = addCell('', '');
+        const deleteButton = document.createElement('button');
+        deleteButton.className = 'btn-danger';
+        deleteButton.type = 'button';
+        deleteButton.textContent = 'Delete';
+        deleteButton.onclick = () => delSocks(Number(s.port));
+        actionCell.appendChild(deleteButton);
+        tb.appendChild(row);
+      });
       if (showOk) setMsg('Refreshed', true);
     }catch(e){ setMsg(e.message || String(e), false); }
   }
@@ -246,17 +302,61 @@ a.nav-link.mx-socks-item{cursor:pointer}
       const tb = document.getElementById('mx-prov-tbody');
       if (!tb) return;
       const rows = data.providers || [];
-      tb.innerHTML = rows.length ? rows.map(p => `
-        <tr>
-          <td><span class="chip">${p.name}</span>${p.protected ? ' <span class="chip">protected</span>' : ''}</td>
-          <td><span class="chip">${p.status||'unknown'}</span></td>
-          <td class="mono">${Number(p.nodes||0)}</td>
-          <td class="mono">${p.type||''}</td>
-          <td class="mono">${p.url||p.path||''}</td>
-          <td class="mono">${p.interval||'-'}</td>
-          <td>${p.protected ? '' : `<button class="btn-danger" data-name="${p.name}">Delete</button>`}</td>
-        </tr>`).join('') : `<tr><td colspan="7" style="opacity:.6;text-align:center;padding:16px">Empty</td></tr>`;
-      tb.querySelectorAll('button[data-name]').forEach(b => b.onclick = () => delProvider(b.getAttribute('data-name')));
+      tb.replaceChildren();
+      if (!rows.length){
+        const row = document.createElement('tr');
+        const cell = document.createElement('td');
+        cell.colSpan = 7;
+        cell.style.opacity = '.6';
+        cell.style.textAlign = 'center';
+        cell.style.padding = '16px';
+        cell.textContent = 'Empty';
+        row.appendChild(cell);
+        tb.appendChild(row);
+        return;
+      }
+
+      rows.forEach(p => {
+        const row = document.createElement('tr');
+        const addCell = (text, className) => {
+          const cell = document.createElement('td');
+          if (className) cell.className = className;
+          cell.textContent = String(text);
+          row.appendChild(cell);
+          return cell;
+        };
+        const addChip = (cell, text) => {
+          const chip = document.createElement('span');
+          chip.className = 'chip';
+          chip.textContent = String(text);
+          cell.appendChild(chip);
+        };
+
+        const nameCell = addCell('', '');
+        addChip(nameCell, p.name || '');
+        if (p.protected){
+          nameCell.appendChild(document.createTextNode(' '));
+          addChip(nameCell, 'protected');
+        }
+
+        const statusCell = addCell('', '');
+        addChip(statusCell, p.status || 'unknown');
+        addCell(Number(p.nodes || 0), 'mono');
+        addCell(p.type || '', 'mono');
+        addCell(p.display_url || p.path || '', 'mono');
+        addCell(p.interval || '-', 'mono');
+
+        const actionCell = addCell('', '');
+        if (!p.protected){
+          const button = document.createElement('button');
+          button.className = 'btn-danger';
+          button.type = 'button';
+          button.textContent = 'Delete';
+          button.onclick = () => delProvider(p.id, p.name);
+          actionCell.appendChild(button);
+        }
+        tb.appendChild(row);
+      });
     }catch(e){ setMsg(e.message || String(e), false); }
   }
 
@@ -304,12 +404,13 @@ a.nav-link.mx-socks-item{cursor:pointer}
     }catch(e){ setMsg(e.message || String(e), false); }
   }
 
-  async function delProvider(name){
-    if (!confirm('Delete subscription ' + name + ' ?')) return;
+  async function delProvider(id, name){
+    const label = name || id;
+    if (!confirm('Delete subscription ' + label + ' ?')) return;
     try{
       setMsg('Deleting...', true);
-      await api('/panel-api/providers?name=' + encodeURIComponent(name), {method:'DELETE'});
-      setMsg('Deleted: ' + name, true);
+      await api('/panel-api/providers?id=' + encodeURIComponent(id), {method:'DELETE'});
+      setMsg('Deleted: ' + label, true);
       await loadProviders();
     }catch(e){ setMsg(e.message || String(e), false); }
   }

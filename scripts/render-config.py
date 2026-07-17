@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import json
 import re
 import secrets
 from pathlib import Path
@@ -30,15 +31,26 @@ def parse_sub_urls(raw: str):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--template", required=True)
-    ap.add_argument("--output", required=True)
-    ap.add_argument("--public-ip", required=True)
-    ap.add_argument("--socks-port", type=int, required=True)
-    ap.add_argument("--socks-user", required=True)
-    ap.add_argument("--socks-pass", required=True)
-    ap.add_argument("--secret", required=True)
+    ap.add_argument("--emit-sub-urls")
+    ap.add_argument("--template")
+    ap.add_argument("--output")
+    ap.add_argument("--public-ip")
+    ap.add_argument("--socks-port", type=int)
+    ap.add_argument("--socks-user")
+    ap.add_argument("--socks-pass")
+    ap.add_argument("--secret")
     ap.add_argument("--sub-urls", default="")
     args = ap.parse_args()
+
+    if args.emit_sub_urls is not None:
+        for name, url in parse_sub_urls(args.emit_sub_urls):
+            print(json.dumps({"name": name, "url": url}, ensure_ascii=False))
+        return
+
+    required = ("template", "output", "public_ip", "socks_port", "socks_user", "socks_pass", "secret")
+    missing = [name.replace("_", "-") for name in required if getattr(args, name) is None]
+    if missing:
+        ap.error("missing required arguments: " + ", ".join(f"--{name}" for name in missing))
 
     cfg = yaml.safe_load(Path(args.template).read_text(encoding="utf-8")) or {}
     cfg["external-controller"] = "127.0.0.1:9091"
@@ -47,19 +59,6 @@ def main():
 
     providers = {}
     provider_names = []
-    for name, url in parse_sub_urls(args.sub_urls):
-        providers[name] = {
-            "type": "http",
-            "url": url,
-            "interval": 3600,
-            "path": f"./providers/{name}.yaml",
-            "health-check": {
-                "enable": True,
-                "interval": 600,
-                "url": "https://www.gstatic.com/generate_204",
-            },
-        }
-        provider_names.append(name)
 
     cfg["proxy-providers"] = providers
 

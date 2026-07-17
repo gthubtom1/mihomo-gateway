@@ -22,15 +22,21 @@ Config backups:
 
 ```bash
 ls -lt /root/mihomo-backups
+find /root/mihomo-backups -maxdepth 3 -type f -print
 ```
+
+Provider deletions are copied under `/root/mihomo-backups/providers/`. Reinstall cleanup stores the previous `config.yaml` and stale YAML together under a timestamped `/root/mihomo-backups/reinstall-*/` directory.
 
 Restore example:
 
 ```bash
 cp /root/mihomo-backups/config.yaml.YYYYMMDD-HHMMSS /etc/mihomo/config.yaml
+cp /root/mihomo-backups/providers/airport.yaml.YYYYMMDD-HHMMSS /etc/mihomo/providers/airport.yaml
 mihomo -t -d /etc/mihomo
 systemctl restart mihomo
 ```
+
+For a reinstall snapshot, restore `reinstall-*/config.yaml` and the matching `reinstall-*/providers/` files as one set.
 
 ## Subscriptions
 
