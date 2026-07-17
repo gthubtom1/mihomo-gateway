@@ -28,9 +28,10 @@ Mihomo Gateway installs an authenticated public SOCKS5 gateway with a MetaCubeXD
 
 ## Pending
 
-- GitHub repository `gthubtom1/mihomo-gateway` is public and `main` is deployed through commit `963dd83`.
+- GitHub repository `gthubtom1/mihomo-gateway` is public and the management API is deployed through commit `760b609`.
 - The target VPS was backed up and installed through the public curl-pipe bootstrap. Existing Nginx and Docker services remained active.
 - Two local YAML files were normalized into static providers with 171 and 20 nodes. AUTO has 191 candidates and GPT has 60; neither automatic group selects `DIRECT` while providers exist.
+- A panel-added HTTPS provider now imports through the verified SOCKS fallback when direct requests are blocked. It cached 20 nodes, and Mihomo's own provider refresh returned HTTP 204.
 - Authenticated SOCKS egress uses an airport exit, temporary SOCKS create/delete passed, the public panel returned the injected UI, and a GPT-routed request reached the target HTTP service.
 - Replace the static providers with panel-managed subscription URLs when the operator has the original URLs; static YAML cannot update itself.
 - Configure HTTPS or restrict the panel network path before treating management credentials as protected in transit.
@@ -38,4 +39,4 @@ Mihomo Gateway installs an authenticated public SOCKS5 gateway with a MetaCubeXD
 
 ## Next Session First Step
 
-Obtain the two original subscription URLs, add them in the panel, verify node counts, then delete the matching static providers so future airport changes update automatically.
+Add the remaining original subscription URL, verify its node count and refresh, then delete each matching static provider to remove duplicate nodes.
