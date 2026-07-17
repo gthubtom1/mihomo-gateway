@@ -27,8 +27,8 @@ Mihomo Gateway installs an authenticated public SOCKS5 gateway with a MetaCubeXD
 
 ## Pending
 
-- Run the final staged secret/IP/token scan and commit the current working tree.
-- Push the three existing local commits plus the final fix commit when GitHub connectivity returns.
+- GitHub private repository `gthubtom1/mihomo-gateway` exists and `main` is pushed through commit `e6f86c6`.
+- Decide whether to make the repository public. Anonymous curl-pipe install cannot use the private raw URL.
 - Back up the live VPS config/provider directory before replacing files or rerunning the installer.
 - Deploy only when SSH/HTTP connectivity returns, then verify a real subscription import, node count, exact deletion, SOCKS create/delete, and authenticated egress.
 - Confirm the one-click command from a clean Linux environment after the pushed `bootstrap.sh` is available remotely.
@@ -37,4 +37,4 @@ Mihomo Gateway installs an authenticated public SOCKS5 gateway with a MetaCubeXD
 
 ## Next Session First Step
 
-Check GitHub and target VPS connectivity. Push first, then back up the VPS and run the live provider/SOCKS lifecycle verification before declaring deployment complete.
+Recheck the target VPS SSH and panel ports; the latest probes found both known VPS SSH ports unreachable and the target panel port timed out. Once reachable, back up first and run the live provider/SOCKS lifecycle verification before declaring deployment complete.
