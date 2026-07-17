@@ -31,6 +31,7 @@ Install-time generated secrets live only on the server:
 - Frontend inject does **not** embed secrets into the published repository assets at build time
 - Users authenticate to MetaCubeXD with the install-generated secret
 - Subscription imports reject credentials in URLs and any DNS result or redirect target that is not a public IP address; initial HTTP/TLS connections are pinned to the validated IP while preserving Host/SNI
+- A 403/429 fallback may use the existing local authenticated SOCKS listener only for HTTPS when its runtime-selected node belongs to a cached provider; the authenticated SOCKS CONNECT request receives the validated IP, not the untrusted hostname, and HTTPS-to-HTTP redirects are rejected
 - Subscription responses are capped at 16 MiB and parsed as Clash/Mihomo YAML before being persisted
 - The generated environment file is Bash-escaped and mode `0600`; the systemd unit and installer stdout do not contain management or SOCKS credentials
 

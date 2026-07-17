@@ -18,12 +18,13 @@ Mihomo Gateway installs an authenticated public SOCKS5 gateway with a MetaCubeXD
 
 ## Verification
 
-- `python -m unittest discover -s tests -v`: 37 tests passing.
+- `python -m unittest discover -s tests -v`: 47 tests passing.
 - `python -m py_compile panel/app.py scripts/render-config.py`: passing.
 - `bash -n bootstrap.sh install.sh uninstall.sh scripts/common.sh scripts/mihomo-gateway`: passing with Git Bash.
 - Extracted injected JavaScript parses with Node.js.
 - `git diff --check`: passing.
 - Two independent read-only reviews completed; confirmed findings for SOCKS XSS, DNS rebinding, UFW rollback, secret handling, and reinstall backup were fixed and covered by tests.
+- Subscription HTTP 429 responses now stop immediate UA retries and retain `Retry-After`. When direct requests remain 403/429 and a cached provider already exists, imports retry through the local authenticated SOCKS listener while still connecting to the validated public IP.
 
 ## Pending
 

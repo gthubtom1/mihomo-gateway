@@ -52,6 +52,8 @@ Panel:
 
 Left sidebar -> SOCKS5 -> Subscription URL
 
+If an HTTPS subscription host returns 403/429, the gateway first stops rate-limit amplification. When an existing cached provider is available and the listener's current runtime route resolves to one of its nodes, it retries through the local authenticated SOCKS route. With no eligible provider route, wait for the reported retry interval or seed the gateway with a local YAML before retrying the URL.
+
 ## SOCKS endpoints
 
 ```bash

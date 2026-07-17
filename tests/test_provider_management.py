@@ -358,6 +358,199 @@ class ProviderManagementTests(unittest.TestCase):
         self.assertIn(b"node-a", normalized)
         self.assertEqual("ClashMeta/1.19.0", ua)
 
+    def test_fetch_stops_after_first_rate_limit_and_reports_retry_after(self):
+        error = _RateLimitError("HTTP Error 429", retry_after="120")
+        with mock.patch.object(gateway, "_assert_safe_subscription_url"), \
+             mock.patch.object(gateway, "_open_subscription", side_effect=error) as opened:
+            with self.assertRaisesRegex(RuntimeError, "retry after 120 seconds"):
+                gateway.fetch_subscription("https://example.com/sub")
+
+        self.assertEqual(1, opened.call_count)
+
+    def test_http_429_preserves_retry_after_header(self):
+        addresses = [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.20", 443)),
+        ]
+        response = _RawHTTPResponse(
+            b"",
+            status=429,
+            headers={"Retry-After": "90"},
+        )
+        connection = mock.Mock()
+        connection.getresponse.return_value = response
+        request = gateway.urllib.request.Request("https://limited.example/sub")
+
+        with mock.patch.object(gateway.socket, "getaddrinfo", return_value=addresses), \
+             mock.patch.object(
+                 gateway.ipaddress,
+                 "ip_address",
+                 return_value=mock.Mock(is_global=True),
+             ), \
+             mock.patch.object(gateway, "_PinnedHTTPSConnection", return_value=connection):
+            with self.assertRaisesRegex(RuntimeError, "HTTP Error 429") as raised:
+                gateway._open_subscription(request, timeout=3)
+
+        self.assertEqual("90", getattr(raised.exception, "retry_after", None))
+
+    def test_fetch_uses_existing_socks_after_all_direct_uas_are_forbidden(self):
+        good = yaml.safe_dump(
+            {"proxies": [{"name": "node-via-proxy", "type": "direct"}]},
+            sort_keys=False,
+        ).encode()
+        forbidden = _HTTPStatusError("HTTP Error 403", status=403)
+        connector = mock.Mock(name="socks_connector")
+        responses = [forbidden] * 6 + [_Response(good)]
+
+        with mock.patch.object(gateway, "_assert_safe_subscription_url"), \
+             mock.patch.object(
+                 gateway,
+                 "_subscription_proxy_connector",
+                 return_value=connector,
+                 create=True,
+             ) as connector_factory, \
+             mock.patch.object(gateway, "_open_subscription", side_effect=responses) as opened:
+            try:
+                normalized, count, _final, _status, _ua = gateway.fetch_subscription(
+                    "https://example.com/sub"
+                )
+            except Exception as exc:
+                self.fail(f"proxy fallback was not used: {exc}")
+
+        self.assertEqual(1, count)
+        self.assertIn(b"node-via-proxy", normalized)
+        connector_factory.assert_called_once_with()
+        self.assertIs(connector, opened.call_args_list[-1].kwargs.get("connector"))
+
+    def test_socks_connector_sends_validated_ip_with_authentication(self):
+        connector = getattr(gateway, "_socks5_connect", None)
+        self.assertIsNotNone(connector, "SOCKS5 connector is required")
+        fake_socket = _FakeSocket(
+            b"\x05\x02"
+            b"\x01\x00"
+            b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+        )
+        with mock.patch.object(gateway.socket, "create_connection", return_value=fake_socket):
+            result = connector(
+                "127.0.0.1",
+                1080,
+                "192.0.2.20",
+                443,
+                "test-user",
+                "test-password",
+                3,
+            )
+
+        self.assertIs(fake_socket, result)
+        connect_request = fake_socket.sent[-1]
+        self.assertEqual(b"\x05\x01\x00\x01", connect_request[:4])
+        self.assertEqual(socket.inet_pton(socket.AF_INET, "192.0.2.20"), connect_request[4:8])
+
+    def test_socks_connector_rejects_no_auth_downgrade_when_credentials_exist(self):
+        fake_socket = _FakeSocket(
+            b"\x05\x00"
+            b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+        )
+        with mock.patch.object(gateway.socket, "create_connection", return_value=fake_socket):
+            with self.assertRaisesRegex(RuntimeError, "authentication"):
+                gateway._socks5_connect(
+                    "127.0.0.1",
+                    1080,
+                    "192.0.2.20",
+                    443,
+                    "test-user",
+                    "test-password",
+                    3,
+                )
+
+    def test_http_subscription_never_uses_socks_fallback(self):
+        forbidden = _HTTPStatusError("HTTP Error 403", status=403)
+        connector = mock.Mock(name="socks_connector")
+        with mock.patch.object(gateway, "_assert_safe_subscription_url"), \
+             mock.patch.object(
+                 gateway,
+                 "_subscription_proxy_connector",
+                 return_value=connector,
+             ) as connector_factory, \
+             mock.patch.object(gateway, "_open_subscription", side_effect=forbidden):
+            with self.assertRaisesRegex(RuntimeError, "HTTP Error 403"):
+                gateway.fetch_subscription("http://example.com/sub?token=test")
+
+        connector_factory.assert_not_called()
+
+    def test_socks_fallback_rejects_https_to_http_redirect(self):
+        redirect = _RawHTTPResponse(
+            b"",
+            status=302,
+            headers={"Location": "http://example.com/sub?token=test"},
+        )
+        wrapped = gateway._SubscriptionResponse(redirect, mock.Mock(), "https://example.com/sub")
+        request = gateway.urllib.request.Request("https://example.com/sub")
+        with mock.patch.object(gateway, "_open_pinned_once", return_value=wrapped), \
+             mock.patch.object(gateway, "_assert_safe_subscription_url"):
+            with self.assertRaisesRegex(RuntimeError, "HTTPS"):
+                gateway._open_subscription(request, timeout=3, connector=mock.Mock())
+
+    def test_direct_retry_after_survives_failed_proxy_fallback(self):
+        direct_limit = _RateLimitError("HTTP Error 429", retry_after="120")
+        proxy_forbidden = _HTTPStatusError("HTTP Error 403", status=403)
+        connector = mock.Mock(name="socks_connector")
+        responses = [direct_limit] + [proxy_forbidden] * 6
+        with mock.patch.object(gateway, "_assert_safe_subscription_url"), \
+             mock.patch.object(
+                 gateway,
+                 "_subscription_proxy_connector",
+                 return_value=connector,
+             ), \
+             mock.patch.object(gateway, "_open_subscription", side_effect=responses):
+            with self.assertRaisesRegex(RuntimeError, "retry after 120 seconds"):
+                gateway.fetch_subscription("https://example.com/sub")
+
+    def test_mixed_direct_errors_do_not_trigger_proxy_fallback(self):
+        mixed_errors = [RuntimeError("network failed")] + [
+            _HTTPStatusError("HTTP Error 403", status=403)
+        ] * 5
+        connector = mock.Mock(name="socks_connector")
+        with mock.patch.object(gateway, "_assert_safe_subscription_url"), \
+             mock.patch.object(
+                 gateway,
+                 "_subscription_proxy_connector",
+                 return_value=connector,
+             ) as connector_factory, \
+             mock.patch.object(gateway, "_open_subscription", side_effect=mixed_errors):
+            with self.assertRaisesRegex(RuntimeError, "HTTP Error 403"):
+                gateway.fetch_subscription("https://example.com/sub")
+
+        connector_factory.assert_not_called()
+
+    def test_subscription_proxy_requires_runtime_route_to_cached_provider(self):
+        cfg = gateway.load_cfg()
+        cfg["proxy-providers"]["static"] = {
+            "type": "file",
+            "path": "./providers/static.yaml",
+        }
+        cfg["listeners"] = [{
+            "name": "socks-main",
+            "type": "socks",
+            "port": 1080,
+            "users": [{"username": "user", "password": "password"}],
+            "proxy": "PROXY",
+        }]
+        gateway.save_cfg(cfg)
+        (gateway.PROVIDERS_DIR / "static.yaml").write_text(
+            "proxies:\n  - name: node-a\n    type: direct\n",
+            encoding="utf-8",
+        )
+
+        with mock.patch.object(
+            gateway,
+            "_runtime_route_uses_provider",
+            return_value=False,
+            create=True,
+        ) as route_check:
+            self.assertIsNone(gateway._subscription_proxy_connector())
+
+        route_check.assert_called_once()
+
     def test_subscription_url_rejects_loopback_target(self):
         body = yaml.safe_dump(
             {"proxies": [{"name": "internal", "type": "direct"}]},
@@ -486,6 +679,37 @@ class _RawHTTPResponse:
 
     def getheader(self, name, default=None):
         return self.headers.get(name, default)
+
+    def close(self):
+        return None
+
+
+class _RateLimitError(RuntimeError):
+    status = 429
+
+    def __init__(self, message, retry_after=None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+class _HTTPStatusError(RuntimeError):
+    def __init__(self, message, status):
+        super().__init__(message)
+        self.status = status
+
+
+class _FakeSocket:
+    def __init__(self, received):
+        self.received = bytearray(received)
+        self.sent = []
+
+    def recv(self, size):
+        chunk = bytes(self.received[:size])
+        del self.received[:size]
+        return chunk
+
+    def sendall(self, data):
+        self.sent.append(data)
 
     def close(self):
         return None

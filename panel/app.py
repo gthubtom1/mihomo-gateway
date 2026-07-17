@@ -17,7 +17,7 @@ import urllib.request
 from html import unescape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urljoin, urlparse, urlsplit
+from urllib.parse import parse_qs, quote, urljoin, urlparse, urlsplit
 
 import yaml
 
@@ -181,8 +181,24 @@ def _assert_safe_subscription_url(raw):
     return raw
 
 
+class SubscriptionHTTPError(RuntimeError):
+    def __init__(self, status, retry_after=None):
+        super().__init__(f"HTTP Error {status}")
+        self.status = status
+        self.retry_after = retry_after
+
+
+class SubscriptionAttemptError(RuntimeError):
+    def __init__(self, last_error, statuses):
+        super().__init__(str(last_error))
+        self.last_error = last_error
+        self.statuses = statuses
+        self.status = getattr(last_error, "status", None)
+        self.retry_after = getattr(last_error, "retry_after", None)
+
+
 class _PinnedHTTPSConnection(http.client.HTTPSConnection):
-    def __init__(self, address, port, server_hostname, timeout):
+    def __init__(self, address, port, server_hostname, timeout, connector=None):
         super().__init__(
             address,
             port,
@@ -190,13 +206,17 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
             context=ssl.create_default_context(),
         )
         self._tls_server_hostname = server_hostname
+        self._connector = connector
 
     def connect(self):
-        self.sock = self._create_connection(
-            (self.host, self.port),
-            self.timeout,
-            self.source_address,
-        )
+        if self._connector:
+            self.sock = self._connector(self.host, self.port, self.timeout)
+        else:
+            self.sock = self._create_connection(
+                (self.host, self.port),
+                self.timeout,
+                self.source_address,
+            )
         if self._tunnel_host:
             self._tunnel()
         self.sock = self._context.wrap_socket(
@@ -235,7 +255,156 @@ class _SubscriptionResponse:
         return False
 
 
-def _open_pinned_once(url, headers, timeout):
+class _ConnectorHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, address, port, timeout, connector):
+        super().__init__(address, port, timeout=timeout)
+        self._connector = connector
+
+    def connect(self):
+        self.sock = self._connector(self.host, self.port, self.timeout)
+
+
+def _recv_exact(sock, size):
+    chunks = []
+    remaining = size
+    while remaining:
+        chunk = sock.recv(remaining)
+        if not chunk:
+            raise RuntimeError("SOCKS5 proxy closed the connection")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _socks5_connect(proxy_host, proxy_port, target_ip, target_port, user, password, timeout):
+    sock = socket.create_connection((proxy_host, int(proxy_port)), timeout=timeout)
+    try:
+        use_auth = bool(user and password)
+        methods = b"\x02" if use_auth else b"\x00"
+        sock.sendall(b"\x05" + bytes([len(methods)]) + methods)
+        version, method = _recv_exact(sock, 2)
+        if version != 5 or method == 0xFF:
+            raise RuntimeError("SOCKS5 proxy rejected authentication methods")
+        if use_auth and method != 2:
+            raise RuntimeError("SOCKS5 proxy rejected username/password authentication")
+        if method == 2:
+            username = str(user or "").encode("utf-8")
+            secret = str(password or "").encode("utf-8")
+            if len(username) > 255 or len(secret) > 255:
+                raise RuntimeError("SOCKS5 credentials are too long")
+            sock.sendall(
+                b"\x01" + bytes([len(username)]) + username
+                + bytes([len(secret)]) + secret
+            )
+            auth_version, auth_status = _recv_exact(sock, 2)
+            if auth_version != 1 or auth_status != 0:
+                raise RuntimeError("SOCKS5 proxy authentication failed")
+        elif method != 0:
+            raise RuntimeError("SOCKS5 proxy selected an unsupported method")
+
+        address = ipaddress.ip_address(target_ip)
+        atyp = 1 if address.version == 4 else 4
+        sock.sendall(
+            b"\x05\x01\x00" + bytes([atyp]) + address.packed
+            + int(target_port).to_bytes(2, "big")
+        )
+        reply_version, reply_status, _reserved, reply_atyp = _recv_exact(sock, 4)
+        if reply_version != 5 or reply_status != 0:
+            raise RuntimeError(f"SOCKS5 proxy connection failed: {reply_status}")
+        if reply_atyp == 1:
+            _recv_exact(sock, 4)
+        elif reply_atyp == 4:
+            _recv_exact(sock, 16)
+        elif reply_atyp == 3:
+            _recv_exact(sock, _recv_exact(sock, 1)[0])
+        else:
+            raise RuntimeError("SOCKS5 proxy returned an invalid address type")
+        _recv_exact(sock, 2)
+        return sock
+    except Exception:
+        sock.close()
+        raise
+
+
+def _provider_proxy_names(path):
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8-sig")) or {}
+        proxies = data.get("proxies") if isinstance(data, dict) else None
+        return {
+            proxy.get("name") for proxy in (proxies or [])
+            if isinstance(proxy, dict) and proxy.get("name")
+        }
+    except Exception:
+        return set()
+
+
+def _runtime_route_uses_provider(group_name, cfg, provider_names):
+    if not group_name or not MIHOMO_SECRET or not provider_names:
+        return False
+    groups = {
+        group.get("name") for group in (cfg.get("proxy-groups") or [])
+        if group.get("name")
+    }
+    current = group_name
+    for _ in range(12):
+        if current == "DIRECT":
+            return False
+        if current not in groups:
+            return current in provider_names
+        try:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:9091/proxies/{quote(current, safe='')}",
+                headers={"Authorization": f"Bearer {MIHOMO_SECRET}"},
+            )
+            with urllib.request.urlopen(req, timeout=2) as response:
+                selected = (json.loads(response.read().decode("utf-8")) or {}).get("now")
+        except Exception:
+            return False
+        if not selected or selected == current:
+            return False
+        current = selected
+    return False
+
+
+def _subscription_proxy_connector():
+    try:
+        cfg = load_cfg()
+    except Exception:
+        return None
+    providers = cfg.get("proxy-providers") or {}
+    provider_names = set()
+    for name, provider in providers.items():
+        try:
+            provider_names.update(_provider_proxy_names(_provider_path(name, provider)))
+        except Exception:
+            continue
+    if not provider_names:
+        return None
+
+    for listener in cfg.get("listeners") or []:
+        users = listener.get("users") or []
+        if listener.get("type") != "socks" or not listener.get("port") or not users:
+            continue
+        user = users[0].get("username") or ""
+        password = users[0].get("password") or ""
+        if not user or not password:
+            continue
+        if not _runtime_route_uses_provider(listener.get("proxy"), cfg, provider_names):
+            continue
+        port = int(listener["port"])
+        return lambda address, target_port, timeout: _socks5_connect(
+            "127.0.0.1",
+            port,
+            address,
+            target_port,
+            user,
+            password,
+            timeout,
+        )
+    return None
+
+
+def _open_pinned_once(url, headers, timeout, connector=None):
     parsed, addresses = _resolve_safe_subscription_url(url)
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
     target = parsed.path or "/"
@@ -253,11 +422,19 @@ def _open_pinned_once(url, headers, timeout):
         connection = None
         try:
             if parsed.scheme == "https":
-                connection = _PinnedHTTPSConnection(
+                kwargs = {
+                    "server_hostname": host,
+                    "timeout": timeout,
+                }
+                if connector:
+                    kwargs["connector"] = connector
+                connection = _PinnedHTTPSConnection(address, port, **kwargs)
+            elif connector:
+                connection = _ConnectorHTTPConnection(
                     address,
                     port,
-                    server_hostname=host,
                     timeout=timeout,
+                    connector=connector,
                 )
             else:
                 connection = http.client.HTTPConnection(address, port, timeout=timeout)
@@ -281,12 +458,14 @@ def _open_pinned_once(url, headers, timeout):
     raise RuntimeError(f"subscription connection failed: {last_error}")
 
 
-def _open_subscription(req, timeout):
+def _open_subscription(req, timeout, connector=None):
     url = req.full_url
+    if connector and urlsplit(url).scheme != "https":
+        raise RuntimeError("subscription proxy fallback requires HTTPS")
     headers = dict(req.header_items())
     redirect_statuses = {301, 302, 303, 307, 308}
     for redirect_count in range(6):
-        response = _open_pinned_once(url, headers, timeout)
+        response = _open_pinned_once(url, headers, timeout, connector=connector)
         if response.status in redirect_statuses:
             location = response.getheader("Location")
             if not location:
@@ -297,13 +476,16 @@ def _open_subscription(req, timeout):
                 raise RuntimeError("subscription has too many redirects")
             next_url = urljoin(url, location)
             response.close()
+            if connector and urlsplit(next_url).scheme != "https":
+                raise RuntimeError("subscription proxy fallback requires HTTPS redirects")
             _assert_safe_subscription_url(next_url)
             url = next_url
             continue
         if response.status >= 400:
             status = response.status
+            retry_after = response.getheader("Retry-After")
             response.close()
-            raise RuntimeError(f"HTTP Error {status}")
+            raise SubscriptionHTTPError(status, retry_after=retry_after)
         response._final_url = url
         return response
     raise RuntimeError("subscription has too many redirects")
@@ -612,32 +794,66 @@ def fetch_subscription(url, timeout=25):
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     ]
     _assert_safe_subscription_url(url)
-    last_err = None
-    for ua in uas:
-        headers = {
-            "User-Agent": ua,
-            "Accept": "*/*",
-            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-            "Accept-Encoding": "identity",
-            "Cache-Control": "no-cache",
-            "Pragma": "no-cache",
-        }
-        try:
-            req = urllib.request.Request(url, headers=headers, method="GET")
-            with _open_subscription(req, timeout=timeout) as r:
-                final = getattr(r, "geturl", lambda: url)()
-                body = r.read(16 * 1024 * 1024 + 1)
-                if len(body) > 16 * 1024 * 1024:
-                    raise RuntimeError("subscription exceeds 16 MiB limit")
-                status = getattr(r, "status", 200)
-                if not body:
-                    raise RuntimeError("empty subscription body")
-                normalized, node_count = normalize_subscription(body)
-                return normalized, node_count, final, status, ua
-        except Exception as e:
-            last_err = e
-            continue
-    raise RuntimeError(last_err)
+
+    def attempt(connector=None):
+        last_error = None
+        statuses = []
+        for ua in uas:
+            headers = {
+                "User-Agent": ua,
+                "Accept": "*/*",
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                "Accept-Encoding": "identity",
+                "Cache-Control": "no-cache",
+                "Pragma": "no-cache",
+            }
+            try:
+                req = urllib.request.Request(url, headers=headers, method="GET")
+                with _open_subscription(req, timeout=timeout, connector=connector) as r:
+                    final = getattr(r, "geturl", lambda: url)()
+                    body = r.read(16 * 1024 * 1024 + 1)
+                    if len(body) > 16 * 1024 * 1024:
+                        raise RuntimeError("subscription exceeds 16 MiB limit")
+                    status = getattr(r, "status", 200)
+                    if not body:
+                        raise RuntimeError("empty subscription body")
+                    normalized, node_count = normalize_subscription(body)
+                    return normalized, node_count, final, status, ua
+            except Exception as e:
+                last_error = e
+                statuses.append(getattr(e, "status", None))
+                if getattr(e, "status", None) == 429:
+                    break
+        last_error = last_error or RuntimeError("subscription fetch failed")
+        raise SubscriptionAttemptError(last_error, statuses)
+
+    try:
+        return attempt()
+    except Exception as direct_error:
+        final_error = direct_error
+        statuses = getattr(direct_error, "statuses", [])
+        rate_limited = getattr(direct_error, "status", None) == 429
+        all_forbidden = bool(statuses) and all(status == 403 for status in statuses)
+        fallback_allowed = urlsplit(url).scheme == "https" and (rate_limited or all_forbidden)
+        if fallback_allowed:
+            connector = _subscription_proxy_connector()
+            if connector:
+                try:
+                    return attempt(connector=connector)
+                except Exception as proxy_error:
+                    final_error = direct_error if rate_limited else proxy_error
+
+        source_error = getattr(final_error, "last_error", final_error)
+        if getattr(final_error, "status", None) == 429:
+            retry_after = getattr(final_error, "retry_after", None)
+            if retry_after and str(retry_after).isdigit():
+                message = f"HTTP Error 429: rate limited; retry after {retry_after} seconds"
+            elif retry_after:
+                message = f"HTTP Error 429: rate limited; retry after {retry_after}"
+            else:
+                message = "HTTP Error 429: rate limited; wait before retrying"
+            raise RuntimeError(message) from source_error
+        raise RuntimeError(source_error) from source_error
 
 
 def normalize_subscription(body):
