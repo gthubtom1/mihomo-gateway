@@ -93,6 +93,55 @@ class ProviderManagementTests(unittest.TestCase):
         self.assertEqual(before, gateway.CONFIG.read_bytes())
         self.assertFalse((gateway.PROVIDERS_DIR / "blocked.yaml").exists())
 
+    def test_add_static_provider_imports_yaml_as_file_provider(self):
+        body = yaml.safe_dump(
+            {
+                "proxies": [{
+                    "name": "local-node",
+                    "type": "ss",
+                    "server": "example.com",
+                    "port": 443,
+                    "cipher": "aes-128-gcm",
+                    "password": "test-password",
+                }],
+                "rules": ["MATCH,DIRECT"],
+            },
+            sort_keys=False,
+        ).encode()
+
+        with mock.patch.object(gateway, "validate_and_restart"):
+            result = gateway.add_static_provider("local", body)
+
+        cfg = gateway.load_cfg()
+        provider = cfg["proxy-providers"]["local"]
+        cache = yaml.safe_load(
+            (gateway.PROVIDERS_DIR / "local.yaml").read_text(encoding="utf-8")
+        )
+        self.assertEqual("file", provider["type"])
+        self.assertEqual("./providers/local.yaml", provider["path"])
+        self.assertNotIn("url", provider)
+        self.assertNotIn("rules", cache)
+        self.assertEqual(1, result["nodes"])
+        self.assertIn("local", cfg["proxy-groups"][0]["use"])
+
+    def test_add_static_provider_rolls_back_when_restart_fails(self):
+        body = yaml.safe_dump(
+            {"proxies": [{"name": "local-node", "type": "direct"}]},
+            sort_keys=False,
+        ).encode()
+        before = gateway.CONFIG.read_bytes()
+
+        with mock.patch.object(
+            gateway,
+            "validate_and_restart",
+            side_effect=[RuntimeError("restart failed"), None],
+        ):
+            with self.assertRaisesRegex(RuntimeError, "restart failed"):
+                gateway.add_static_provider("local", body)
+
+        self.assertEqual(before, gateway.CONFIG.read_bytes())
+        self.assertFalse((gateway.PROVIDERS_DIR / "local.yaml").exists())
+
     def test_orphan_yaml_is_listed_and_can_be_deleted_with_backup(self):
         orphan = gateway.PROVIDERS_DIR / " 旧机场 .yaml"
         orphan.write_text("proxies:\n  - name: old-node\n    type: direct\n", encoding="utf-8")
@@ -842,6 +891,14 @@ class ProviderManagementTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "too large"):
             handler._body()
+
+    def test_yaml_upload_body_has_subscription_size_limit(self):
+        handler = object.__new__(gateway.H)
+        handler.headers = {"Content-Length": str(16 * 1024 * 1024 + 1)}
+        handler.rfile = io.BytesIO(b"")
+
+        with self.assertRaisesRegex(RuntimeError, "too large"):
+            handler._raw_body(gateway.MAX_SUBSCRIPTION_BODY)
 
 
 def _capture_error(errors, action):

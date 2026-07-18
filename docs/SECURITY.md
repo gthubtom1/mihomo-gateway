@@ -32,7 +32,7 @@ Install-time generated secrets live only on the server:
 - Users authenticate to MetaCubeXD with the install-generated secret
 - Subscription imports reject credentials in URLs and any DNS result or redirect target that is not a public IP address; initial HTTP/TLS connections are pinned to the validated IP while preserving Host/SNI
 - A 403/429 fallback may use the existing local authenticated SOCKS listener only for HTTPS when its runtime-selected node belongs to a cached provider; the authenticated SOCKS CONNECT request receives the validated IP, not the untrusted hostname, and HTTPS-to-HTTP redirects are rejected
-- Subscription responses are capped at 16 MiB. Clash/Mihomo YAML is validated directly; other formats are converted by pinned Sub-Store `proxy-utils` in a no-network process running as `nobody`, then validated again before persistence
+- Subscription responses and local uploads are capped at 16 MiB. Clash/Mihomo YAML is validated directly; other formats are converted by pinned Sub-Store `proxy-utils` in a no-network process running as `nobody`, then validated again before persistence
 - Managed provider refresh URLs point to the loopback API, force `DIRECT`, and require the existing management secret. The original upstream URL remains in root-only Mihomo configuration as `x-source-url`
 - The generated environment file is Bash-escaped and mode `0600`; the systemd unit and installer stdout do not contain management or SOCKS credentials
 

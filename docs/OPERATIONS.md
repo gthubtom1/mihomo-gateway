@@ -50,13 +50,15 @@ mihomo-gateway provider del airport3
 
 Panel:
 
-Left sidebar -> SOCKS5 -> Subscription URL
+Left sidebar -> SOCKS5 -> Subscription URL or YAML file
+
+Local YAML uploads are capped at 16 MiB, normalized to their `proxies` list, validated, and stored as static file providers. A failed validation or Mihomo restart rolls back both config and cache.
 
 If an HTTPS subscription host returns 403/429, the gateway first stops rate-limit amplification. When an existing cached provider is available and the listener's current runtime route resolves to one of its nodes, it retries through the local authenticated SOCKS route. With no eligible provider route, wait for the reported retry interval or seed the gateway with a local YAML before retrying the URL.
 
 New managed providers can accept Clash/Mihomo YAML and common Base64/URI client subscription formats. Their Mihomo URL points to the authenticated loopback management API; `x-source-url` stores the original URL in `/etc/mihomo/config.yaml`. Each scheduled refresh re-fetches, converts when necessary, and validates the result before Mihomo replaces its cache.
 
-A URL that expires minutes after extraction is only suitable for seeding a snapshot. The validated cache remains usable when a later fetch fails, but automatic updates require a stable upstream URL. Convert intentionally short-lived sources to a file provider after the initial import to avoid repeated failed refreshes.
+If only a generated URL expires while the downloaded node credentials remain valid, the downloaded YAML can be kept as a static provider. If the response contains ports or credentials that expire too, the provider must refresh before that lifetime ends. Set the interval accordingly, but respect upstream `Retry-After`; a token that returns persistent `403/429` needs a fresh URL or YAML from the airport.
 
 Converter diagnostics:
 

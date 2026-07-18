@@ -17,7 +17,7 @@ import urllib.request
 from html import unescape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, quote, urljoin, urlparse, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse, urlsplit
 
 import yaml
 
@@ -34,6 +34,7 @@ PROTECTED_PROVIDERS = set(
 MUTATION_LOCK = threading.RLock()
 PROVIDER_REFRESH_LOCKS = {}
 MAX_API_BODY = 64 * 1024
+MAX_SUBSCRIPTION_BODY = 16 * 1024 * 1024
 MAX_CONVERTED_BODY = 32 * 1024 * 1024
 CONVERTER_WRAPPER = Path(os.environ.get(
     "SUBSTORE_CONVERTER_WRAPPER",
@@ -1105,6 +1106,61 @@ def add_provider(name, url, interval=3600):
         }
 
 
+def add_static_provider(name, body):
+    name = (name or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", name):
+        raise RuntimeError("name invalid: use A-Za-z0-9_- (1-32)")
+    if name in PROTECTED_PROVIDERS:
+        raise RuntimeError(f"protected provider: {name}")
+    if not isinstance(body, bytes) or not body:
+        raise RuntimeError("subscription file is empty")
+    if len(body) > MAX_SUBSCRIPTION_BODY:
+        raise RuntimeError("subscription file is too large")
+    normalized, node_count = normalize_subscription(body)
+
+    with MUTATION_LOCK:
+        cfg = load_cfg()
+        providers = cfg.setdefault("proxy-providers", {})
+        if name in providers:
+            raise RuntimeError(f"provider exists: {name}")
+        cache_path = _safe_provider_path(name)
+        if cache_path.exists():
+            raise RuntimeError(
+                f"orphan provider file exists: {cache_path.name}; delete it first"
+            )
+        original_config = CONFIG.read_bytes()
+        providers[name] = {
+            "type": "file",
+            "path": f"./providers/{name}.yaml",
+            "health-check": {
+                "enable": True,
+                "interval": 600,
+                "url": "https://www.gstatic.com/generate_204",
+            },
+        }
+        attach_provider_to_groups(cfg, name)
+        try:
+            _atomic_write(cache_path, normalized)
+            save_cfg(cfg)
+            validate_and_restart()
+        except Exception:
+            _restore_config(original_config)
+            cache_path.unlink(missing_ok=True)
+            try:
+                validate_and_restart()
+            except Exception:
+                pass
+            raise
+        return {
+            "name": name,
+            "type": "file",
+            "display_url": "",
+            "interval": None,
+            "path": f"./providers/{name}.yaml",
+            "nodes": node_count,
+        }
+
+
 def del_provider(name=None, provider_id=None):
     with MUTATION_LOCK:
         cfg = load_cfg()
@@ -1186,6 +1242,17 @@ class H(BaseHTTPRequestHandler):
             raise RuntimeError("request body too large")
         return json.loads(self.rfile.read(n).decode("utf-8")) if n else {}
 
+    def _raw_body(self, limit):
+        n = int(self.headers.get("Content-Length") or 0)
+        if n <= 0:
+            raise RuntimeError("request body is empty")
+        if n > limit:
+            raise RuntimeError("request body too large")
+        raw = self.rfile.read(n)
+        if len(raw) != n:
+            raise RuntimeError("request body is incomplete")
+        return raw
+
     def _auth_ok(self):
         if not MIHOMO_SECRET:
             return False
@@ -1228,6 +1295,10 @@ class H(BaseHTTPRequestHandler):
         if not self._auth_ok():
             return self._json(401, {"error": "unauthorized"})
         try:
+            if u.path == "/panel-api/providers/yaml":
+                name = unquote(self.headers.get("X-Provider-Name") or "")
+                raw = self._raw_body(MAX_SUBSCRIPTION_BODY)
+                return self._json(200, add_static_provider(name, raw))
             body = self._body()
             if u.path == "/panel-api/socks":
                 return self._json(200, add_socks(

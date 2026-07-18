@@ -147,6 +147,10 @@ a.nav-link.mx-socks-item{cursor:pointer}
             <div><label>Interval(sec)</label><input id="mx-prov-interval" type="number" value="3600"/></div>
             <div style="display:flex;align-items:end"><button class="btn" id="mx-prov-add" type="button">Add</button></div>
           </div>
+          <div style="display:grid;grid-template-columns:1fr auto;gap:10px;align-items:end;margin-top:10px">
+            <div><label>YAML file</label><input id="mx-prov-file" type="file" accept=".yaml,.yml,application/yaml,text/yaml"/></div>
+            <button class="btn2" id="mx-prov-import" type="button">Import YAML</button>
+          </div>
           <div style="overflow:auto;margin-top:12px">
             <table>
               <thead><tr><th>Name</th><th>Status</th><th>Nodes</th><th>Type</th><th>URL/Path</th><th>Interval</th><th></th></tr></thead>
@@ -169,6 +173,7 @@ a.nav-link.mx-socks-item{cursor:pointer}
     page.querySelector('#mx-create').onclick = createSocks;
     page.querySelector('#mx-socks-refresh').onclick = () => { loadSocks(true); loadProviders(); };
     page.querySelector('#mx-prov-add').onclick = addProvider;
+    page.querySelector('#mx-prov-import').onclick = importProviderFile;
     page.querySelector('#mx-secret-save').onclick = () => {
       const v = document.getElementById('mx-secret').value || '';
       if (!setManualSecret(v)) { setMsg('Secret 不能为空', false); return; }
@@ -411,6 +416,31 @@ a.nav-link.mx-socks-item{cursor:pointer}
       setMsg('Deleting...', true);
       await api('/panel-api/providers?id=' + encodeURIComponent(id), {method:'DELETE'});
       setMsg('Deleted: ' + label, true);
+      await loadProviders();
+    }catch(e){ setMsg(e.message || String(e), false); }
+  }
+
+  async function importProviderFile(){
+    try{
+      const name = document.getElementById('mx-prov-name').value.trim();
+      const input = document.getElementById('mx-prov-file');
+      const file = input.files && input.files[0];
+      if (!name) throw new Error('Name 不能为空');
+      if (!file) throw new Error('请选择 YAML 文件');
+      if (file.size > 16 * 1024 * 1024) throw new Error('YAML 文件不能超过 16 MiB');
+      setMsg('Importing YAML (restarts mihomo)...', true);
+      const raw = await file.arrayBuffer();
+      const j = await api('/panel-api/providers/yaml', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/yaml',
+          'X-Provider-Name': encodeURIComponent(name),
+        },
+        body: raw,
+      });
+      setMsg('Imported provider: ' + j.name + ' (' + Number(j.nodes||0) + ' nodes)', true);
+      document.getElementById('mx-prov-name').value = '';
+      input.value = '';
       await loadProviders();
     }catch(e){ setMsg(e.message || String(e), false); }
   }

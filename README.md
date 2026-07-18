@@ -8,7 +8,7 @@ One-click Mihomo (Clash.Meta) public SOCKS5 gateway for VPS, with MetaCubeXD pan
 - Accept Clash/Mihomo YAML plus common Base64, URI, Surge, Quantumult, and similar subscription formats through a pinned Sub-Store parser
 - Multi-group routing: AUTO / GPT / region groups
 - MetaCubeXD dashboard on port 9090
-- Sidebar tools: create/delete SOCKS5 ports, add/delete subscription URLs
+- Sidebar tools: create/delete SOCKS5 ports, add/delete subscription URLs, and import local YAML files
 - systemd services + Nginx static UI with WebSocket overview
 - Secrets generated at install time (never committed)
 
@@ -71,10 +71,11 @@ Left sidebar **SOCKS5**:
 
 - create/delete public SOCKS5 ports
 - add/delete airport subscription URLs (writes providers and reloads)
+- import/delete local Clash or Mihomo YAML files as static providers
 
 Managed URL providers refresh through the local API, which safely fetches the original URL and serves converted Mihomo YAML back to the core. Common `ss`, `ssr`, `vmess`, `vless`, `trojan`, Hysteria, TUIC, and AnyTLS-style inputs are supported by the bundled parser version. Provider-specific encrypted formats, browser login/CAPTCHA flows, and expired or IP-blocked tokens still require a valid compatible URL from the airport.
 
-Short-lived extraction URLs can seed the cache, but they cannot update after they expire. Use a stable subscription URL for automatic refresh, or keep the imported cache as a static provider snapshot.
+If only the download URL expires while its node credentials remain valid, import the downloaded YAML as a static snapshot. If the returned node ports or credentials also expire, a static snapshot will stop working; automatic refresh requires a stable extraction endpoint and an interval shorter than the credential lifetime. A URL returning `403/429` or an expired token must be replaced by the airport.
 
 ## Commands
 

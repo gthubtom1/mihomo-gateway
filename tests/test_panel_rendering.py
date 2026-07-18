@@ -50,6 +50,12 @@ class PanelProviderRenderingTests(unittest.TestCase):
             ),
         )
 
+    def test_yaml_file_import_uses_raw_body_and_encoded_name_header(self):
+        self.assertIn('id="mx-prov-file"', self.source)
+        self.assertIn("/panel-api/providers/yaml", self.source)
+        self.assertIn("file.arrayBuffer()", self.source)
+        self.assertIn("'X-Provider-Name': encodeURIComponent(name)", self.source)
+
 
 if __name__ == "__main__":
     unittest.main()
