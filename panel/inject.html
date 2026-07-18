@@ -147,10 +147,12 @@ a.nav-link.mx-socks-item{cursor:pointer}
             <div><label>Interval(sec)</label><input id="mx-prov-interval" type="number" value="3600"/></div>
             <div style="display:flex;align-items:end"><button class="btn" id="mx-prov-add" type="button">Add</button></div>
           </div>
-          <div style="display:grid;grid-template-columns:1fr auto;gap:10px;align-items:end;margin-top:10px">
+          <div style="display:grid;grid-template-columns:1fr 2fr auto;gap:10px;align-items:end;margin-top:10px">
+            <div><label>Name</label><input id="mx-yaml-name" placeholder="local-yaml"/></div>
             <div><label>YAML file</label><input id="mx-prov-file" type="file" accept=".yaml,.yml,application/yaml,text/yaml"/></div>
             <button class="btn2" id="mx-prov-import" type="button">Import YAML</button>
           </div>
+          <div id="mx-yaml-status" style="min-height:18px;margin-top:8px;font-size:12px"></div>
           <div style="overflow:auto;margin-top:12px">
             <table>
               <thead><tr><th>Name</th><th>Status</th><th>Nodes</th><th>Type</th><th>URL/Path</th><th>Interval</th><th></th></tr></thead>
@@ -174,6 +176,12 @@ a.nav-link.mx-socks-item{cursor:pointer}
     page.querySelector('#mx-socks-refresh').onclick = () => { loadSocks(true); loadProviders(); };
     page.querySelector('#mx-prov-add').onclick = addProvider;
     page.querySelector('#mx-prov-import').onclick = importProviderFile;
+    page.querySelector('#mx-prov-file').onchange = event => {
+      const file = event.target.files && event.target.files[0];
+      const name = document.getElementById('mx-yaml-name');
+      if (file && name && !name.value.trim()) name.value = defaultYamlName(file.name);
+      setYamlStatus('', true);
+    };
     page.querySelector('#mx-secret-save').onclick = () => {
       const v = document.getElementById('mx-secret').value || '';
       if (!setManualSecret(v)) { setMsg('Secret 不能为空', false); return; }
@@ -422,13 +430,14 @@ a.nav-link.mx-socks-item{cursor:pointer}
 
   async function importProviderFile(){
     try{
-      const name = document.getElementById('mx-prov-name').value.trim();
+      const name = document.getElementById('mx-yaml-name').value.trim();
       const input = document.getElementById('mx-prov-file');
       const file = input.files && input.files[0];
       if (!name) throw new Error('Name 不能为空');
       if (!file) throw new Error('请选择 YAML 文件');
       if (file.size > 16 * 1024 * 1024) throw new Error('YAML 文件不能超过 16 MiB');
       setMsg('Importing YAML (restarts mihomo)...', true);
+      setYamlStatus('Importing...', true);
       const raw = await file.arrayBuffer();
       const j = await api('/panel-api/providers/yaml', {
         method: 'POST',
@@ -439,10 +448,32 @@ a.nav-link.mx-socks-item{cursor:pointer}
         body: raw,
       });
       setMsg('Imported provider: ' + j.name + ' (' + Number(j.nodes||0) + ' nodes)', true);
-      document.getElementById('mx-prov-name').value = '';
+      setYamlStatus('Imported: ' + j.name + ' (' + Number(j.nodes||0) + ' nodes)', true);
+      document.getElementById('mx-yaml-name').value = '';
       input.value = '';
       await loadProviders();
-    }catch(e){ setMsg(e.message || String(e), false); }
+    }catch(e){
+      const message = e.message || String(e);
+      setMsg(message, false);
+      setYamlStatus(message, false);
+    }
+  }
+
+  function defaultYamlName(filename){
+    const stem = String(filename || '').replace(/\.[^.]+$/, '');
+    const cleaned = stem.replace(/[^A-Za-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '');
+    if (cleaned) return cleaned.slice(0, 32);
+    const now = new Date();
+    const pad = value => String(value).padStart(2, '0');
+    return ('yaml-' + now.getFullYear() + pad(now.getMonth() + 1) + pad(now.getDate())
+      + '-' + pad(now.getHours()) + pad(now.getMinutes()) + pad(now.getSeconds())).slice(0, 32);
+  }
+
+  function setYamlStatus(text, ok){
+    const el = document.getElementById('mx-yaml-status');
+    if (!el) return;
+    el.textContent = text || '';
+    el.style.color = text ? (ok ? '#86efac' : '#fca5a5') : '';
   }
 
   function hideNativeMain(hide){

@@ -52,9 +52,13 @@ class PanelProviderRenderingTests(unittest.TestCase):
 
     def test_yaml_file_import_uses_raw_body_and_encoded_name_header(self):
         self.assertIn('id="mx-prov-file"', self.source)
+        self.assertIn('id="mx-yaml-name"', self.source)
+        self.assertIn('id="mx-yaml-status"', self.source)
         self.assertIn("/panel-api/providers/yaml", self.source)
         self.assertIn("file.arrayBuffer()", self.source)
         self.assertIn("'X-Provider-Name': encodeURIComponent(name)", self.source)
+        self.assertIn("defaultYamlName(file.name)", self.source)
+        self.assertIn("document.getElementById('mx-yaml-name').value.trim()", self.source)
 
 
 if __name__ == "__main__":
