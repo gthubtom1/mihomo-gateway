@@ -54,6 +54,20 @@ Left sidebar -> SOCKS5 -> Subscription URL
 
 If an HTTPS subscription host returns 403/429, the gateway first stops rate-limit amplification. When an existing cached provider is available and the listener's current runtime route resolves to one of its nodes, it retries through the local authenticated SOCKS route. With no eligible provider route, wait for the reported retry interval or seed the gateway with a local YAML before retrying the URL.
 
+New managed providers can accept Clash/Mihomo YAML and common Base64/URI client subscription formats. Their Mihomo URL points to the authenticated loopback management API; `x-source-url` stores the original URL in `/etc/mihomo/config.yaml`. Each scheduled refresh re-fetches, converts when necessary, and validates the result before Mihomo replaces its cache.
+
+A URL that expires minutes after extraction is only suitable for seeding a snapshot. The validated cache remains usable when a later fetch fails, but automatic updates require a stable upstream URL. Convert intentionally short-lived sources to a file provider after the initial import to avoid repeated failed refreshes.
+
+Converter diagnostics:
+
+```bash
+/opt/mihomo-gateway/node/bin/node --version
+sha256sum /opt/mihomo-gateway/vendor/proxy-utils.esm.mjs
+journalctl -u mihomo-gateway-api -n 100 --no-pager
+```
+
+The expected converter version and checksum are recorded in `scripts/common.sh`. Conversion requires a host where Bubblewrap can create user, mount, PID, IPC, UTS, and network namespaces. The child runs as UID/GID 65534 with no capabilities, a private writable work directory, and `prlimit` bounds for memory, CPU, processes, and output size. Containers that disable unprivileged or nested namespaces are not supported. Do not replace the module without updating the pin, tests, and security review.
+
 ## SOCKS endpoints
 
 ```bash

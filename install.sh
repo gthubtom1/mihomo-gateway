@@ -10,9 +10,11 @@ detect_public_ip
 prepare_dirs
 install_dependencies
 install_mihomo_binary
+install_panel_api
+install_node_runtime
+install_subscription_converter
 generate_secrets
 render_runtime_config
-install_panel_api
 install_nginx_site
 install_systemd_units
 enable_firewall

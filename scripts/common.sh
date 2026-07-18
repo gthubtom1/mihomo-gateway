@@ -14,6 +14,12 @@ ENV_FILE="${STATE_ROOT}/env"
 PANEL_API_PORT_DEFAULT=9092
 PANEL_PORT_DEFAULT=9090
 SOCKS_PORT_DEFAULT=1080
+SUBSTORE_VERSION="2.36.7"
+SUBSTORE_SHA256="fede079cf5f67e095c3d6e858851a7d6fa6e92954be5fa3acbfe9e48a9a71a3d"
+NODE_VERSION="20.19.5"
+NODE_SHA256_X64="315046739a513a70e03a4a55a8afda8cf979f30852e576075c340084e3f8ac0f"
+NODE_SHA256_ARM64="d462267863ae8ee556039ebdf559055a8ec562c633889ef1403f3adb449ba1dd"
+NODE_SHA256_ARMV7L="a8236299680e1d7267454971a31e0f770859000ac5a5ad87ad6603415b033d9b"
 
 log()  { echo -e "[*] $*"; }
 ok()   { echo -e "[+] $*"; }
@@ -42,7 +48,36 @@ prepare_dirs() {
 install_dependencies() {
   log "installing dependencies"
   apt-get update -qq
-  apt-get install -y -qq curl ca-certificates gzip tar unzip python3 python3-yaml nginx ufw jq >/dev/null
+  apt-get install -y -qq bubblewrap curl ca-certificates gzip tar xz-utils unzip python3 python3-yaml nginx ufw jq >/dev/null
+}
+
+install_node_runtime() {
+  local node_bin="${INSTALL_ROOT}/node/bin/node"
+  if [[ -x "${node_bin}" ]] && [[ "$("${node_bin}" --version)" == "v${NODE_VERSION}" ]]; then
+    ok "private Node runtime already installed: v${NODE_VERSION}"
+    return
+  fi
+
+  log "installing pinned private Node runtime"
+  local arch node_arch checksum url tmp extracted
+  arch="$(uname -m)"
+  case "${arch}" in
+    x86_64|amd64) node_arch="x64"; checksum="${NODE_SHA256_X64}" ;;
+    aarch64|arm64) node_arch="arm64"; checksum="${NODE_SHA256_ARM64}" ;;
+    armv7l) node_arch="armv7l"; checksum="${NODE_SHA256_ARMV7L}" ;;
+    *) die "unsupported Node architecture: ${arch}" ;;
+  esac
+  url="https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${node_arch}.tar.xz"
+  tmp="$(mktemp -d)"
+  curl -fL --retry 3 --connect-timeout 15 "${url}" -o "${tmp}/node.tar.xz"
+  printf '%s  %s\n' "${checksum}" "${tmp}/node.tar.xz" | sha256sum -c - >/dev/null
+  tar -xJf "${tmp}/node.tar.xz" -C "${tmp}"
+  extracted="${tmp}/node-v${NODE_VERSION}-linux-${node_arch}/bin/node"
+  [[ -x "${extracted}" ]] || die "Node binary missing from verified archive"
+  mkdir -p "${INSTALL_ROOT}/node/bin"
+  install -m 755 "${extracted}" "${node_bin}"
+  rm -rf "${tmp}"
+  ok "installed private Node runtime v${NODE_VERSION}"
 }
 
 install_mihomo_binary() {
@@ -132,8 +167,7 @@ render_runtime_config() {
     --socks-port "${SOCKS_PORT}" \
     --socks-user "${SOCKS_USER}" \
     --socks-pass "${SOCKS_PASS}" \
-    --secret "${MIHOMO_SECRET}" \
-    --sub-urls "${SUB_URLS:-}"
+    --secret "${MIHOMO_SECRET}"
 
   chmod 600 "${RUNTIME_ROOT}/config.yaml"
   mihomo -t -d "${RUNTIME_ROOT}" >/dev/null
@@ -145,7 +179,7 @@ import_initial_subscriptions() {
 
   local root records record name url
   root="${ROOT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-  if ! records="$(python3 "${root}/scripts/render-config.py" --emit-sub-urls "${raw}")"; then
+  if ! records="$(printf '%s' "${raw}" | python3 "${root}/scripts/render-config.py" --emit-sub-urls -)"; then
     die "failed to parse initial subscriptions"
   fi
   while IFS= read -r record; do
@@ -153,7 +187,7 @@ import_initial_subscriptions() {
     name="$(printf '%s' "${record}" | jq -r '.name')"
     url="$(printf '%s' "${record}" | jq -r '.url')"
     log "importing initial subscription: ${name}"
-    if ! mihomo-gateway provider add "${name}" "${url}" 3600 >/dev/null; then
+    if ! printf '%s' "${url}" | mihomo-gateway provider add "${name}" - 3600 >/dev/null; then
       die "failed to import initial subscription: ${name}"
     fi
   done <<< "${records}"
@@ -164,6 +198,7 @@ install_panel_api() {
   mkdir -p "${INSTALL_ROOT}/panel"
   install -m 755 "${ROOT_DIR}/panel/app.py" "${INSTALL_ROOT}/panel/app.py"
   install -m 644 "${ROOT_DIR}/panel/inject.html" "${INSTALL_ROOT}/panel/inject.html"
+  install -m 644 "${ROOT_DIR}/panel/convert-subscription.mjs" "${INSTALL_ROOT}/panel/convert-subscription.mjs"
   install -m 755 "${ROOT_DIR}/scripts/mihomo-gateway" /usr/local/bin/mihomo-gateway
 
   # download metacubexd UI if missing
@@ -204,6 +239,48 @@ Path("${RUNTIME_ROOT}/ui/config.js").write_text(
 )
 print("ui inject ok")
 PY
+}
+
+install_subscription_converter() {
+  log "installing pinned multi-format subscription converter"
+  local node_bin="${INSTALL_ROOT}/node/bin/node"
+  [[ -x "${node_bin}" ]] || die "private Node runtime is required for subscription conversion"
+  command -v bwrap >/dev/null 2>&1 || die "bubblewrap is required for converter isolation"
+  command -v prlimit >/dev/null 2>&1 || die "prlimit is required for converter limits"
+
+  local vendor_dir url tmp
+  vendor_dir="${INSTALL_ROOT}/vendor"
+  url="https://github.com/sub-store-org/Sub-Store/releases/download/${SUBSTORE_VERSION}/proxy-utils.esm.mjs"
+  tmp="$(mktemp)"
+  curl -fL --retry 3 --connect-timeout 15 "${url}" -o "${tmp}"
+  printf '%s  %s\n' "${SUBSTORE_SHA256}" "${tmp}" | sha256sum -c - >/dev/null
+  mkdir -p "${vendor_dir}"
+  install -m 644 "${tmp}" "${vendor_dir}/proxy-utils.esm.mjs"
+  rm -f "${tmp}"
+
+  local smoke converter_work
+  converter_work="$(mktemp -d /root/.mihomo-converter.XXXXXX)"
+  chmod 777 "${converter_work}"
+  if ! smoke="$(printf 'c3M6Ly9ZV1Z6TFRFeU9DMW5ZMjA2Y0dGemMwQmxlR0Z0Y0d4bExtTnZiVG8wTkRNPSNzbW9rZQo=' \
+    | bwrap --unshare-all --die-with-parent --new-session --clearenv \
+      --uid 65534 --gid 65534 --cap-drop ALL \
+      --ro-bind /usr /usr --ro-bind /lib /lib --ro-bind-try /lib64 /lib64 \
+      --dir /etc --ro-bind-try /etc/ld.so.cache /etc/ld.so.cache \
+      --ro-bind "${node_bin}" /runtime/node \
+      --ro-bind "${INSTALL_ROOT}/panel/convert-subscription.mjs" /runtime/convert.mjs \
+      --ro-bind "${vendor_dir}/proxy-utils.esm.mjs" /runtime/proxy-utils.mjs \
+      --bind "${converter_work}" /work --tmpfs /tmp --dev /dev --proc /proc \
+      --chdir /work --setenv HOME /work --setenv TMPDIR /work --setenv SUBSTORE_WORK_DIR /work \
+      prlimit --as=1073741824 --cpu=20 --nproc=16 --fsize=33554432 -- \
+      /runtime/node --max-old-space-size=256 /runtime/convert.mjs /runtime/proxy-utils.mjs)"; then
+    rm -rf "${converter_work}"
+    die "subscription converter smoke test failed"
+  fi
+  rm -rf "${converter_work}"
+  printf '%s' "${smoke}" | python3 -c \
+    'import sys,yaml; p=(yaml.safe_load(sys.stdin.read()) or {}).get("proxies") or []; raise SystemExit(0 if len(p)==1 and p[0].get("type")=="ss" else 1)' \
+    || die "subscription converter smoke test failed"
+  ok "installed Sub-Store proxy-utils ${SUBSTORE_VERSION}"
 }
 
 install_nginx_site() {

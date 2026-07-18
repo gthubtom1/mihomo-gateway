@@ -15,15 +15,22 @@ need_cmd systemctl
 need_cmd curl
 
 json_payload() {
-  python3 - "$@" <<'PY'
+  local kind="$1"; shift
+  if [[ "${kind}" == "provider" ]]; then
+    local name="$1" interval="$2"
+    python3 -c '
+import json, sys
+print(json.dumps({"name": sys.argv[1], "url": sys.stdin.read(), "interval": int(sys.argv[2])}, ensure_ascii=False))
+' "${name}" "${interval}"
+    return
+  fi
+  python3 - "$kind" "$@" <<'PY'
 import json
 import sys
 
 kind = sys.argv[1]
 if kind == "socks":
     payload = {"port": int(sys.argv[2]), "group": sys.argv[3]}
-elif kind == "provider":
-    payload = {"name": sys.argv[2], "url": sys.argv[3], "interval": int(sys.argv[4])}
 else:
     raise SystemExit("unknown payload type")
 print(json.dumps(payload, ensure_ascii=False))
@@ -33,12 +40,30 @@ PY
 api() {
   local method="$1"; shift
   local path="$1"; shift
+  local body="${1:-0}"
   local secret="${MIHOMO_SECRET:-}"
   [[ -n "${secret}" ]] || { echo "MIHOMO_SECRET missing in ${ENV_FILE}"; exit 1; }
-  curl -fsS -X "${method}" \
-    -H "Authorization: Bearer ${secret}" \
-    -H "Content-Type: application/json" \
-    "http://127.0.0.1:${PANEL_API_PORT:-9092}${path}" "$@"
+  local header_file status
+  header_file="$(mktemp)"
+  chmod 600 "${header_file}"
+  printf 'Authorization: Bearer %s\nContent-Type: application/json\n' "${secret}" > "${header_file}"
+  if [[ "${body}" == "1" ]]; then
+    if curl -fsS -X "${method}" -H "@${header_file}" --data-binary @- \
+      "http://127.0.0.1:${PANEL_API_PORT:-9092}${path}"; then
+      status=0
+    else
+      status=$?
+    fi
+  else
+    if curl -fsS -X "${method}" -H "@${header_file}" \
+      "http://127.0.0.1:${PANEL_API_PORT:-9092}${path}"; then
+      status=0
+    else
+      status=$?
+    fi
+  fi
+  rm -f "${header_file}"
+  return "${status}"
 }
 
 cmd="${1:-status}"
@@ -56,8 +81,7 @@ case "${cmd}" in
       add)
         port="${1:-}"; group="${2:-PROXY}"
         [[ -n "${port}" ]] || { echo "usage: mihomo-gateway socks add <port> [group]"; exit 1; }
-        payload="$(json_payload socks "${port}" "${group}")"
-        api POST /panel-api/socks -d "${payload}" | python3 -m json.tool
+        json_payload socks "${port}" "${group}" | api POST /panel-api/socks 1 | python3 -m json.tool
         ;;
       del)
         port="${1:-}"
@@ -74,8 +98,11 @@ case "${cmd}" in
       add)
         name="${1:-}"; url="${2:-}"; interval="${3:-3600}"
         [[ -n "${name}" && -n "${url}" ]] || { echo "usage: mihomo-gateway provider add <name> <url> [interval]"; exit 1; }
-        payload="$(json_payload provider "${name}" "${url}" "${interval}")"
-        api POST /panel-api/providers -d "${payload}" | python3 -m json.tool
+        if [[ "${url}" == "-" ]]; then
+          url="$(cat)"
+        fi
+        printf '%s' "${url}" | json_payload provider "${name}" "${interval}" \
+          | api POST /panel-api/providers 1 | python3 -m json.tool
         ;;
       del)
         name="${1:-}"

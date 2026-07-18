@@ -20,6 +20,7 @@ INSTALL_SH = ROOT / "install.sh"
 BOOTSTRAP_SH = ROOT / "bootstrap.sh"
 README = ROOT / "README.md"
 PANEL_API_SERVICE = ROOT / "panel" / "mihomo-gateway-api.service"
+CONVERTER_WRAPPER = ROOT / "panel" / "convert-subscription.mjs"
 GATEWAY_CLI = ROOT / "scripts" / "mihomo-gateway"
 
 SPEC = importlib.util.spec_from_file_location("render_config", RENDER_CONFIG)
@@ -107,6 +108,77 @@ class InstallConfigTests(unittest.TestCase):
         source = INSTALL_SH.read_text(encoding="utf-8")
         self.assertLess(source.index("start_services"), source.index("import_initial_subscriptions"))
         self.assertLess(source.index("import_initial_subscriptions"), source.index("print_summary"))
+
+    def test_installer_keeps_subscription_urls_out_of_child_argv(self):
+        common = COMMON_SH.read_text(encoding="utf-8")
+        gateway_cli = GATEWAY_CLI.read_text(encoding="utf-8")
+
+        self.assertNotIn('--sub-urls "${SUB_URLS:-}"', common)
+        self.assertIn('--emit-sub-urls -', common)
+        self.assertIn('provider add "${name}" -', common)
+        self.assertNotIn('-H "Authorization: Bearer ${secret}"', gateway_cli)
+        self.assertNotIn('-d "${payload}"', gateway_cli)
+        self.assertIn('--data-binary @-', gateway_cli)
+        self.assertIn('-H "@${header_file}"', gateway_cli)
+
+    def test_installer_pins_and_verifies_substore_converter(self):
+        common = COMMON_SH.read_text(encoding="utf-8")
+        install = INSTALL_SH.read_text(encoding="utf-8")
+
+        self.assertIn("xz-utils", common)
+        self.assertIn("bubblewrap", common)
+        self.assertNotIn("python3-yaml nodejs", common)
+        self.assertIn('NODE_VERSION="20.19.5"', common)
+        self.assertIn(
+            'NODE_SHA256_X64="315046739a513a70e03a4a55a8afda8cf979f30852e576075c340084e3f8ac0f"',
+            common,
+        )
+        self.assertIn(
+            'NODE_SHA256_ARM64="d462267863ae8ee556039ebdf559055a8ec562c633889ef1403f3adb449ba1dd"',
+            common,
+        )
+        self.assertIn(
+            'NODE_SHA256_ARMV7L="a8236299680e1d7267454971a31e0f770859000ac5a5ad87ad6603415b033d9b"',
+            common,
+        )
+        self.assertIn("nodejs.org/dist/v${NODE_VERSION}", common)
+        self.assertIn('SUBSTORE_VERSION="2.36.7"', common)
+        self.assertIn(
+            'SUBSTORE_SHA256="fede079cf5f67e095c3d6e858851a7d6fa6e92954be5fa3acbfe9e48a9a71a3d"',
+            common,
+        )
+        self.assertIn("releases/download/${SUBSTORE_VERSION}/proxy-utils.esm.mjs", common)
+        self.assertIn("sha256sum -c", common)
+        self.assertIn("bwrap --unshare-all", common)
+        self.assertIn('converter_work="$(mktemp -d /root/.mihomo-converter.XXXXXX)"', common)
+        self.assertNotIn('chown nobody:nogroup "${converter_work}"', common)
+        self.assertIn("convert-subscription.mjs", common)
+        self.assertLess(
+            install.index("install_node_runtime"),
+            install.index("install_subscription_converter"),
+        )
+        self.assertLess(
+            install.index("install_subscription_converter"),
+            install.index("start_services"),
+        )
+        self.assertLess(
+            install.index("install_subscription_converter"),
+            install.index("render_runtime_config"),
+        )
+
+    def test_converter_wrapper_only_parses_supplied_content(self):
+        source = CONVERTER_WRAPPER.read_text(encoding="utf-8")
+
+        self.assertIn('fs.readFileSync(0, "utf8")', source)
+        self.assertIn('produce(proxies, "Mihomo", "external")', source)
+        self.assertNotIn("fetch(", source)
+        self.assertNotIn("http://", source)
+        self.assertNotIn("https://", source)
+
+    def test_panel_api_remains_python_38_compatible(self):
+        source = (ROOT / "panel" / "app.py").read_text(encoding="utf-8")
+
+        self.assertNotIn(".removeprefix(", source)
 
     def test_installer_does_not_stop_unrelated_port_owners_or_nginx_sites(self):
         source = COMMON_SH.read_text(encoding="utf-8")
@@ -278,22 +350,39 @@ printf 'install incorrectly continued\n'
             [json.loads(line) for line in result.stdout.splitlines()],
         )
 
+    def test_subscription_parser_reads_sensitive_urls_from_stdin(self):
+        raw = "named|https://example.com/one.yaml,https://example.com/two.yaml"
+        result = subprocess.run(
+            [sys.executable, str(RENDER_CONFIG), "--emit-sub-urls", "-"],
+            input=raw,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(
+            ["named", "sub2"],
+            [json.loads(line)["name"] for line in result.stdout.splitlines()],
+        )
+
     @unittest.skipUnless(BASH, "bash is required to exercise the gateway CLI")
     def test_provider_cli_json_encodes_subscription_url(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             capture = root / "curl-args.txt"
+            payload_capture = root / "curl-payload.json"
             url = 'https://example.com/sub?label="quoted"&path=\\value'
             env = os.environ.copy()
             env["CAPTURE_FILE"] = str(capture)
+            env["PAYLOAD_CAPTURE_FILE"] = str(payload_capture)
             env["MIHOMO_SECRET"] = "test-secret"
             env["TEST_PYTHON"] = Path(sys.executable).as_posix()
             command = (
                 "python3() { \"$TEST_PYTHON\" \"$@\"; }; "
-                "curl() { printf '%s\\n' \"$@\" > \"$CAPTURE_FILE\"; printf '{\"ok\":true}\\n'; }; "
+                "curl() { printf '%s\\n' \"$@\" > \"$CAPTURE_FILE\"; cat > \"$PAYLOAD_CAPTURE_FILE\"; printf '{\"ok\":true}\\n'; }; "
                 "systemctl() { return 0; }; "
-                f"set -- provider add airport {shlex.quote(url)} 3600; "
-                f"source {shlex.quote(GATEWAY_CLI.as_posix())}"
+                f"printf '%s' {shlex.quote(url)} | (set -- provider add airport - 3600; "
+                f"source {shlex.quote(GATEWAY_CLI.as_posix())})"
             )
             result = subprocess.run(
                 [BASH, "-c", command],
@@ -304,8 +393,11 @@ printf 'install incorrectly continued\n'
 
             self.assertEqual(0, result.returncode, result.stdout + result.stderr)
             args = capture.read_text(encoding="utf-8").splitlines()
-            payload = args[args.index("-d") + 1]
-            self.assertEqual(url, json.loads(payload)["url"])
+            payload = json.loads(payload_capture.read_text(encoding="utf-8"))
+            self.assertEqual(url, payload["url"])
+            self.assertIn("--data-binary", args)
+            self.assertNotIn(url, args)
+            self.assertFalse(any("test-secret" in arg for arg in args))
 
     @unittest.skipUnless(BASH, "bash is required to exercise provider storage cleanup")
     def test_reinstall_backs_up_and_removes_stale_provider_yaml(self):

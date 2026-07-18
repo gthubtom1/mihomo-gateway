@@ -1,3 +1,4 @@
+import base64
 import importlib.util
 import http.client
 import io
@@ -28,6 +29,7 @@ class ProviderManagementTests(unittest.TestCase):
         gateway.BACKUP_DIR = root / "backups"
         gateway.PROVIDERS_DIR.mkdir()
         gateway.PROTECTED_PROVIDERS = set()
+        gateway.MIHOMO_SECRET = "test-secret"
         gateway.CONFIG.write_text(
             yaml.safe_dump(
                 {
@@ -64,12 +66,17 @@ class ProviderManagementTests(unittest.TestCase):
         self.assertEqual(1, result["nodes"])
         self.assertEqual("node-a", cache["proxies"][0]["name"])
         self.assertEqual(
-            ["ClashMeta/1.19.0"],
-            cfg["proxy-providers"]["airport"]["header"]["User-Agent"],
+            "http://127.0.0.1:9092/internal/providers/airport",
+            cfg["proxy-providers"]["airport"]["url"],
         )
         self.assertEqual(
             "https://example.com/sub?token=secret",
-            cfg["proxy-providers"]["airport"]["url"],
+            cfg["proxy-providers"]["airport"]["x-source-url"],
+        )
+        self.assertEqual("DIRECT", cfg["proxy-providers"]["airport"]["proxy"])
+        self.assertEqual(
+            ["test-secret"],
+            cfg["proxy-providers"]["airport"]["header"]["X-Secret"],
         )
         self.assertIn("airport", cfg["proxy-groups"][0]["use"])
 
@@ -342,7 +349,24 @@ class ProviderManagementTests(unittest.TestCase):
         self.assertEqual(1, max_active)
         self.assertEqual({"one", "two"}, set(gateway.load_cfg()["proxy-providers"]))
 
-    def test_fetch_retries_when_first_user_agent_returns_non_yaml(self):
+    def test_fetch_starts_with_browser_user_agent(self):
+        good = yaml.safe_dump(
+            {"proxies": [{"name": "node-browser", "type": "direct"}]},
+            sort_keys=False,
+        ).encode()
+        with mock.patch.object(gateway, "_assert_safe_subscription_url"), \
+             mock.patch.object(gateway, "_open_subscription", return_value=_Response(good)) as opened:
+            normalized, count, _final, _status, ua = gateway.fetch_subscription(
+                "https://example.com/sub"
+            )
+
+        self.assertEqual(1, count)
+        self.assertIn(b"node-browser", normalized)
+        self.assertTrue(ua.startswith("Mozilla/5.0"))
+        request = opened.call_args.args[0]
+        self.assertTrue(request.get_header("User-agent").startswith("Mozilla/5.0"))
+
+    def test_fetch_retries_when_browser_user_agent_returns_non_subscription(self):
         good = yaml.safe_dump(
             {"proxies": [{"name": "node-a", "type": "direct"}]},
             sort_keys=False,
@@ -356,7 +380,83 @@ class ProviderManagementTests(unittest.TestCase):
 
         self.assertEqual(1, count)
         self.assertIn(b"node-a", normalized)
-        self.assertEqual("ClashMeta/1.19.0", ua)
+        self.assertEqual("clash.meta", ua)
+
+    def test_normalize_uses_substore_for_base64_uri_subscription(self):
+        raw = base64.b64encode(
+            b"ss://YWVzLTEyOC1nY206cGFzc0BleGFtcGxlLmNvbTo0NDM=#node-a\n"
+        )
+        converted = yaml.safe_dump(
+            {
+                "proxies": [{
+                    "name": "node-a",
+                    "type": "ss",
+                    "server": "example.com",
+                    "port": 443,
+                    "cipher": "aes-128-gcm",
+                    "password": "pass",
+                }]
+            },
+            sort_keys=False,
+        ).encode()
+
+        with mock.patch.object(
+            gateway,
+            "_convert_with_substore",
+            return_value=converted,
+            create=True,
+        ) as convert:
+            normalized, count = gateway.normalize_subscription(raw)
+
+        convert.assert_called_once_with(raw, timeout=30)
+        self.assertEqual(1, count)
+        self.assertEqual("ss", yaml.safe_load(normalized)["proxies"][0]["type"])
+
+    def test_normalize_rejects_invalid_converter_output(self):
+        with mock.patch.object(
+            gateway,
+            "_convert_with_substore",
+            return_value=b"not: a-provider\n",
+            create=True,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "converter output"):
+                gateway.normalize_subscription(b"dmxlc3M6Ly9leGFtcGxl")
+
+    def test_converter_uses_private_ephemeral_work_directory(self):
+        converted = yaml.safe_dump(
+            {"proxies": [{"name": "node-a", "type": "direct"}]},
+            sort_keys=False,
+        ).encode()
+        def fake_run(*_args, **kwargs):
+            kwargs["stdout"].write(converted)
+            return mock.Mock(returncode=0)
+        temporary = mock.MagicMock()
+        temporary.__enter__.return_value = "/tmp/converter-private"
+        temporary.__exit__.return_value = False
+
+        with mock.patch.object(Path, "is_file", return_value=True), \
+             mock.patch.object(gateway.tempfile, "TemporaryDirectory", return_value=temporary), \
+             mock.patch.object(gateway.os, "chown", create=True) as chown, \
+             mock.patch.object(gateway.os, "chmod") as chmod, \
+             mock.patch.object(gateway.subprocess, "run", side_effect=fake_run) as run:
+            output = gateway._convert_with_substore(b"raw subscription")
+
+        self.assertEqual(converted, output)
+        chown.assert_not_called()
+        chmod.assert_called_once_with("/tmp/converter-private", 0o777)
+        self.assertEqual("/", run.call_args.kwargs["cwd"])
+        self.assertIsNot(run.call_args.kwargs["stdout"], subprocess.PIPE)
+        command = run.call_args.args[0]
+        self.assertIn("/usr/bin/bwrap", command)
+        self.assertIn("--unshare-all", command)
+        self.assertIn("--cap-drop", command)
+        self.assertIn("/usr/bin/prlimit", command)
+        self.assertIn("--fsize=33554432", command)
+        bind_index = command.index("--bind")
+        self.assertEqual(
+            ["/tmp/converter-private", "/work"],
+            command[bind_index + 1:bind_index + 3],
+        )
 
     def test_fetch_stops_after_first_rate_limit_and_reports_retry_after(self):
         error = _RateLimitError("HTTP Error 429", retry_after="120")
@@ -366,6 +466,20 @@ class ProviderManagementTests(unittest.TestCase):
                 gateway.fetch_subscription("https://example.com/sub")
 
         self.assertEqual(1, opened.call_count)
+
+    def test_fetch_timeout_is_a_total_budget_across_user_agents(self):
+        def slow_failure(*_args, **_kwargs):
+            time.sleep(0.03)
+            raise RuntimeError("network failed")
+
+        started = time.monotonic()
+        with mock.patch.object(gateway, "_assert_safe_subscription_url"), \
+             mock.patch.object(gateway, "_open_subscription", side_effect=slow_failure) as opened:
+            with self.assertRaisesRegex(RuntimeError, "timed out"):
+                gateway.fetch_subscription("https://example.com/sub", timeout=0.05)
+
+        self.assertLess(time.monotonic() - started, 0.15)
+        self.assertLessEqual(opened.call_count, 2)
 
     def test_http_429_preserves_retry_after_header(self):
         addresses = [
@@ -489,6 +603,19 @@ class ProviderManagementTests(unittest.TestCase):
              mock.patch.object(gateway, "_assert_safe_subscription_url"):
             with self.assertRaisesRegex(RuntimeError, "HTTPS"):
                 gateway._open_subscription(request, timeout=3, connector=mock.Mock())
+
+    def test_direct_fetch_rejects_https_to_http_redirect(self):
+        redirect = _RawHTTPResponse(
+            b"",
+            status=302,
+            headers={"Location": "http://example.com/sub?token=test"},
+        )
+        wrapped = gateway._SubscriptionResponse(redirect, mock.Mock(), "https://example.com/sub")
+        request = gateway.urllib.request.Request("https://example.com/sub")
+        with mock.patch.object(gateway, "_open_pinned_once", return_value=wrapped), \
+             mock.patch.object(gateway, "_assert_safe_subscription_url"):
+            with self.assertRaisesRegex(RuntimeError, "downgrade"):
+                gateway._open_subscription(request, timeout=3)
 
     def test_direct_retry_after_survives_failed_proxy_fallback(self):
         direct_limit = _RateLimitError("HTTP Error 429", retry_after="120")
@@ -633,6 +760,80 @@ class ProviderManagementTests(unittest.TestCase):
         self.assertNotIn("url", row)
         self.assertNotIn("secret", row["display_url"])
         self.assertNotIn("alice", row["display_url"])
+
+    def test_provider_list_uses_redacted_source_url_for_converted_provider(self):
+        cfg = gateway.load_cfg()
+        cfg["proxy-providers"]["airport"] = {
+            "type": "http",
+            "url": "http://127.0.0.1:9092/internal/providers/airport",
+            "x-source-url": "https://example.com/sub/path?token=secret&user=alice",
+            "path": "./providers/airport.yaml",
+        }
+        row = gateway.list_providers(cfg)[0]
+
+        self.assertIn("example.com", row["display_url"])
+        self.assertNotIn("127.0.0.1", row["display_url"])
+        self.assertNotIn("secret", row["display_url"])
+        self.assertNotIn("alice", row["display_url"])
+
+    def test_refresh_converted_provider_uses_original_source_url(self):
+        cfg = gateway.load_cfg()
+        cfg["proxy-providers"]["airport"] = {
+            "type": "http",
+            "url": "http://127.0.0.1:9092/internal/providers/airport",
+            "x-source-url": "https://example.com/sub?token=secret",
+            "path": "./providers/airport.yaml",
+        }
+        normalized = yaml.safe_dump(
+            {"proxies": [{"name": "node-a", "type": "direct"}]},
+            sort_keys=False,
+        ).encode()
+        with mock.patch.object(
+            gateway,
+            "fetch_subscription",
+            return_value=(normalized, 1, "https://example.com/final", 200, "browser"),
+        ) as fetch:
+            body, count = gateway.refresh_converted_provider("airport", cfg)
+
+        fetch.assert_called_once_with("https://example.com/sub?token=secret", timeout=15)
+        self.assertEqual(normalized, body)
+        self.assertEqual(1, count)
+
+    def test_concurrent_managed_refresh_serves_existing_cache_immediately(self):
+        cfg = gateway.load_cfg()
+        cfg["proxy-providers"]["airport"] = {
+            "type": "http",
+            "url": "http://127.0.0.1:9092/internal/providers/airport",
+            "x-source-url": "https://example.com/sub",
+            "path": "./providers/airport.yaml",
+        }
+        cache = yaml.safe_dump(
+            {"proxies": [{"name": "cached", "type": "direct"}]},
+            sort_keys=False,
+        ).encode()
+        (gateway.PROVIDERS_DIR / "airport.yaml").write_bytes(cache)
+        lock = threading.Lock()
+        lock.acquire()
+
+        with mock.patch.object(gateway, "_provider_refresh_lock", return_value=lock, create=True), \
+             mock.patch.object(gateway, "refresh_converted_provider") as refresh:
+            body, count = gateway.managed_provider_content("airport", cfg)
+
+        lock.release()
+        refresh.assert_not_called()
+        self.assertEqual(1, count)
+        self.assertIn(b"cached", body)
+
+    def test_refresh_rejects_provider_without_managed_source(self):
+        cfg = gateway.load_cfg()
+        cfg["proxy-providers"]["airport"] = {
+            "type": "http",
+            "url": "https://example.com/sub",
+            "path": "./providers/airport.yaml",
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "managed provider"):
+            gateway.refresh_converted_provider("airport", cfg)
 
     def test_management_request_body_has_application_size_limit(self):
         handler = object.__new__(gateway.H)

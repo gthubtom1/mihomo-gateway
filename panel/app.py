@@ -32,7 +32,21 @@ PROTECTED_PROVIDERS = set(
     x.strip() for x in os.environ.get("PROTECTED_PROVIDERS", "").split(",") if x.strip()
 )
 MUTATION_LOCK = threading.RLock()
+PROVIDER_REFRESH_LOCKS = {}
 MAX_API_BODY = 64 * 1024
+MAX_CONVERTED_BODY = 32 * 1024 * 1024
+CONVERTER_WRAPPER = Path(os.environ.get(
+    "SUBSTORE_CONVERTER_WRAPPER",
+    str(Path(__file__).resolve().with_name("convert-subscription.mjs")),
+))
+CONVERTER_MODULE = Path(os.environ.get(
+    "SUBSTORE_PROXY_UTILS",
+    str(Path(__file__).resolve().parent.parent / "vendor" / "proxy-utils.esm.mjs"),
+))
+NODE_BINARY = os.environ.get(
+    "NODE_BINARY",
+    str(Path(__file__).resolve().parent.parent / "node" / "bin" / "node"),
+)
 
 
 def load_cfg():
@@ -476,6 +490,11 @@ def _open_subscription(req, timeout, connector=None):
                 raise RuntimeError("subscription has too many redirects")
             next_url = urljoin(url, location)
             response.close()
+            if (
+                urlsplit(url).scheme == "https"
+                and urlsplit(next_url).scheme != "https"
+            ):
+                raise RuntimeError("subscription redirect cannot downgrade HTTPS")
             if connector and urlsplit(next_url).scheme != "https":
                 raise RuntimeError("subscription proxy fallback requires HTTPS redirects")
             _assert_safe_subscription_url(next_url)
@@ -575,7 +594,7 @@ def list_providers(cfg):
             "id": _resource_id("provider", name),
             "name": name,
             "type": p.get("type"),
-            "display_url": _display_url(p.get("url")),
+            "display_url": _display_url(p.get("x-source-url") or p.get("url")),
             "path": p.get("path") or "",
             "interval": p.get("interval"),
             "protected": name in PROTECTED_PROVIDERS,
@@ -784,21 +803,29 @@ def fetch_subscription(url, timeout=25):
     Many airports return 403 to bare Python UA / short UA.
     """
     uas = [
+        # Browser first: some subscription gateways reject or rate-limit client UAs.
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         # common clash clients
         "clash.meta",
         "ClashMeta/1.19.0",
         "clash-verge/v2.0.0",
         "ClashForWindows/0.20.39",
         "mihomo/1.19.0",
-        # browser fallback for strict CDNs
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     ]
     _assert_safe_subscription_url(url)
+    deadline = time.monotonic() + max(0.05, float(timeout))
+
+    def remaining():
+        value = deadline - time.monotonic()
+        if value <= 0:
+            raise RuntimeError("subscription fetch timed out")
+        return value
 
     def attempt(connector=None):
         last_error = None
         statuses = []
         for ua in uas:
+            request_timeout = remaining()
             headers = {
                 "User-Agent": ua,
                 "Accept": "*/*",
@@ -809,7 +836,11 @@ def fetch_subscription(url, timeout=25):
             }
             try:
                 req = urllib.request.Request(url, headers=headers, method="GET")
-                with _open_subscription(req, timeout=timeout, connector=connector) as r:
+                with _open_subscription(
+                    req,
+                    timeout=request_timeout,
+                    connector=connector,
+                ) as r:
                     final = getattr(r, "geturl", lambda: url)()
                     body = r.read(16 * 1024 * 1024 + 1)
                     if len(body) > 16 * 1024 * 1024:
@@ -817,7 +848,10 @@ def fetch_subscription(url, timeout=25):
                     status = getattr(r, "status", 200)
                     if not body:
                         raise RuntimeError("empty subscription body")
-                    normalized, node_count = normalize_subscription(body)
+                    normalized, node_count = normalize_subscription(
+                        body,
+                        timeout=remaining(),
+                    )
                     return normalized, node_count, final, status, ua
             except Exception as e:
                 last_error = e
@@ -856,31 +890,157 @@ def fetch_subscription(url, timeout=25):
         raise RuntimeError(source_error) from source_error
 
 
-def normalize_subscription(body):
+def _normalize_clash_document(body, error_prefix="subscription"):
     try:
         text = body.decode("utf-8-sig")
     except UnicodeDecodeError as e:
-        raise RuntimeError(f"subscription is not UTF-8 Clash YAML: {e}")
+        raise RuntimeError(f"{error_prefix} is not UTF-8 YAML: {e}")
     try:
         data = yaml.safe_load(text)
     except yaml.YAMLError as e:
-        raise RuntimeError(f"subscription is not valid Clash YAML: {e}")
+        raise RuntimeError(f"{error_prefix} is not valid YAML: {e}")
     if not isinstance(data, dict):
-        raise RuntimeError(
-            "subscription is not Clash/Mihomo YAML; select the Clash subscription URL"
-        )
+        return None
     proxies = data.get("proxies")
     if not isinstance(proxies, list) or not proxies:
-        raise RuntimeError(
-            "subscription contains no proxies; select the Clash/Mihomo subscription URL"
-        )
+        return None
     for index, proxy in enumerate(proxies, 1):
         if not isinstance(proxy, dict) or not proxy.get("name") or not proxy.get("type"):
-            raise RuntimeError(f"invalid proxy at item {index}: name/type required")
+            raise RuntimeError(
+                f"{error_prefix} has invalid proxy at item {index}: name/type required"
+            )
     normalized = yaml.safe_dump(
         {"proxies": proxies}, allow_unicode=True, sort_keys=False
     ).encode("utf-8")
     return normalized, len(proxies)
+
+
+def _convert_with_substore(body, timeout=30):
+    required = [
+        Path(NODE_BINARY),
+        Path("/usr/bin/bwrap"),
+        Path("/usr/bin/prlimit"),
+        CONVERTER_WRAPPER,
+        CONVERTER_MODULE,
+    ]
+    if not all(path.is_file() for path in required):
+        raise RuntimeError("multi-format subscription converter is not installed")
+    command = [
+        "/usr/bin/bwrap",
+        "--unshare-all", "--die-with-parent", "--new-session",
+        "--clearenv", "--uid", "65534", "--gid", "65534",
+        "--cap-drop", "ALL",
+        "--ro-bind", "/usr", "/usr",
+        "--ro-bind", "/lib", "/lib",
+        "--ro-bind-try", "/lib64", "/lib64",
+        "--dir", "/etc",
+        "--ro-bind-try", "/etc/ld.so.cache", "/etc/ld.so.cache",
+        "--ro-bind", NODE_BINARY, "/runtime/node",
+        "--ro-bind", str(CONVERTER_WRAPPER), "/runtime/convert.mjs",
+        "--ro-bind", str(CONVERTER_MODULE), "/runtime/proxy-utils.mjs",
+        "--bind", "/work", "/work",
+        "--tmpfs", "/tmp", "--dev", "/dev", "--proc", "/proc",
+        "--chdir", "/work",
+        "--setenv", "HOME", "/work",
+        "--setenv", "TMPDIR", "/work",
+        "--setenv", "SUBSTORE_WORK_DIR", "/work",
+        "/usr/bin/prlimit",
+        "--as=1073741824", "--cpu=20", "--nproc=16",
+        f"--fsize={MAX_CONVERTED_BODY}", "--",
+        "/runtime/node", "--max-old-space-size=256",
+        "/runtime/convert.mjs", "/runtime/proxy-utils.mjs",
+    ]
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix=".mihomo-converter-",
+            dir=str(BACKUP_DIR.parent),
+        ) as work_dir:
+            os.chmod(work_dir, 0o777)
+            command[command.index("/work", command.index("--bind"))] = work_dir
+            with tempfile.TemporaryFile() as output_file:
+                result = subprocess.run(
+                    command,
+                    input=body,
+                    stdout=output_file,
+                    stderr=subprocess.DEVNULL,
+                    timeout=max(0.1, float(timeout)),
+                    cwd="/",
+                    env={"PATH": "/usr/bin:/bin", "NODE_NO_WARNINGS": "1"},
+                )
+                output_file.seek(0)
+                output = output_file.read(MAX_CONVERTED_BODY + 1)
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError("subscription converter timed out") from e
+    if result.returncode != 0:
+        raise RuntimeError("subscription converter rejected this format")
+    if not output or len(output) > MAX_CONVERTED_BODY:
+        raise RuntimeError("subscription converter returned invalid output size")
+    return output
+
+
+def normalize_subscription(body, timeout=30):
+    try:
+        normalized = _normalize_clash_document(body)
+    except RuntimeError:
+        normalized = None
+    if normalized:
+        return normalized
+
+    converted = _convert_with_substore(body, timeout=timeout)
+    try:
+        normalized = _normalize_clash_document(converted, "converter output")
+    except RuntimeError as e:
+        raise RuntimeError(f"converter output is invalid: {e}") from e
+    if not normalized:
+        raise RuntimeError("converter output contains no Mihomo proxies")
+    return normalized
+
+
+def _internal_provider_url(name):
+    return f"http://127.0.0.1:{LISTEN_PORT}/internal/providers/{name}"
+
+
+def _provider_refresh_lock(name):
+    with MUTATION_LOCK:
+        return PROVIDER_REFRESH_LOCKS.setdefault(name, threading.Lock())
+
+
+def _cached_provider_content(name, provider):
+    path = _provider_path(name, provider)
+    if not path.is_file():
+        raise RuntimeError("managed provider cache is missing")
+    normalized = _normalize_clash_document(path.read_bytes(), "provider cache")
+    if not normalized:
+        raise RuntimeError("managed provider cache contains no proxies")
+    return normalized
+
+
+def refresh_converted_provider(name, cfg=None):
+    cfg = cfg or load_cfg()
+    provider = (cfg.get("proxy-providers") or {}).get(name)
+    if not provider or not provider.get("x-source-url"):
+        raise RuntimeError("managed provider not found")
+    if provider.get("url") != _internal_provider_url(name):
+        raise RuntimeError("managed provider URL is invalid")
+    normalized, count, _final_url, _status, _user_agent = fetch_subscription(
+        provider["x-source-url"],
+        timeout=15,
+    )
+    return normalized, count
+
+
+def managed_provider_content(name, cfg=None):
+    cfg = cfg or load_cfg()
+    provider = (cfg.get("proxy-providers") or {}).get(name)
+    if not provider or not provider.get("x-source-url"):
+        raise RuntimeError("managed provider not found")
+    lock = _provider_refresh_lock(name)
+    if not lock.acquire(blocking=False):
+        return _cached_provider_content(name, provider)
+    try:
+        return refresh_converted_provider(name, cfg)
+    finally:
+        lock.release()
 
 
 def add_provider(name, url, interval=3600):
@@ -910,10 +1070,12 @@ def add_provider(name, url, interval=3600):
         original_config = CONFIG.read_bytes()
         providers[name] = {
             "type": "http",
-            "url": url,
+            "url": _internal_provider_url(name),
+            "x-source-url": url,
+            "proxy": "DIRECT",
             "interval": interval,
             "path": f"./providers/{name}.yaml",
-            "header": {"User-Agent": [user_agent]},
+            "header": {"X-Secret": [MIHOMO_SECRET]},
             "health-check": {
                 "enable": True,
                 "interval": 600,
@@ -1011,6 +1173,13 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
+    def _raw(self, code, body, content_type="text/plain; charset=utf-8"):
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def _body(self):
         n = int(self.headers.get("Content-Length") or 0)
         if n < 0 or n > MAX_API_BODY:
@@ -1029,6 +1198,20 @@ class H(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         if u.path == "/healthz":
             return self._json(200, {"ok": True})
+        if u.path.startswith("/internal/providers/"):
+            if (
+                self.client_address[0] not in {"127.0.0.1", "::1"}
+                or not self._auth_ok()
+            ):
+                return self._json(404, {"error": "not found"})
+            name = u.path[len("/internal/providers/"):]
+            if not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", name):
+                return self._json(404, {"error": "not found"})
+            try:
+                body, _count = managed_provider_content(name)
+                return self._raw(200, body, "application/yaml; charset=utf-8")
+            except Exception:
+                return self._raw(502, b"provider refresh failed\n")
         if not u.path.startswith("/panel-api/"):
             return self._json(404, {"error": "not found"})
         if not self._auth_ok():

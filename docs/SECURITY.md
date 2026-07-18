@@ -32,7 +32,8 @@ Install-time generated secrets live only on the server:
 - Users authenticate to MetaCubeXD with the install-generated secret
 - Subscription imports reject credentials in URLs and any DNS result or redirect target that is not a public IP address; initial HTTP/TLS connections are pinned to the validated IP while preserving Host/SNI
 - A 403/429 fallback may use the existing local authenticated SOCKS listener only for HTTPS when its runtime-selected node belongs to a cached provider; the authenticated SOCKS CONNECT request receives the validated IP, not the untrusted hostname, and HTTPS-to-HTTP redirects are rejected
-- Subscription responses are capped at 16 MiB and parsed as Clash/Mihomo YAML before being persisted
+- Subscription responses are capped at 16 MiB. Clash/Mihomo YAML is validated directly; other formats are converted by pinned Sub-Store `proxy-utils` in a no-network process running as `nobody`, then validated again before persistence
+- Managed provider refresh URLs point to the loopback API, force `DIRECT`, and require the existing management secret. The original upstream URL remains in root-only Mihomo configuration as `x-source-url`
 - The generated environment file is Bash-escaped and mode `0600`; the systemd unit and installer stdout do not contain management or SOCKS credentials
 
 ## Known residual risks
@@ -40,7 +41,8 @@ Install-time generated secrets live only on the server:
 - HTTP panel still exposes secret in browser localStorage after login (MetaCubeXD design)
 - Public SOCKS ports can be scanned; use strong passwords
 - Adding subscription restarts mihomo briefly
-- Mihomo performs later HTTP-provider refreshes itself; add-time URL checks cannot prevent a trusted provider host from changing DNS behavior afterward
+- Legacy/direct HTTP providers still refresh through Mihomo. Providers created by current versions refresh through the local API and repeat URL, DNS, redirect, size, format, and conversion checks each time
+- The converter and its private Node 20 runtime are pinned to fixed versions with SHA256 verification. Bubblewrap gives the child private user, mount, PID, IPC, UTS, and network namespaces; it runs as UID/GID 65534 with no capabilities, sees only read-only runtime files plus an ephemeral work directory, and is bounded by `prlimit` for memory, CPU, processes, and output size. Upgrading either pin still requires a supply-chain review
 - The one-click bootstrap, Mihomo binary lookup, and MetaCubeXD download track mutable/default upstream refs unless the operator pins and audits them
 - Backups have no automatic retention policy; monitor `/root/mihomo-backups` and prune only after external backups are verified
 

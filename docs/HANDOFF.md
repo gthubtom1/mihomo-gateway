@@ -6,8 +6,9 @@ Mihomo Gateway installs an authenticated public SOCKS5 gateway with a MetaCubeXD
 
 ## Current State
 
-- Provider URL imports retry client user agents, validate Clash/Mihomo YAML, cap downloads at 16 MiB, and reject private/reserved targets and redirects before changing runtime config.
-- Imported provider content is persisted as Mihomo's local provider cache while the original stable subscription URL is retained for refreshes.
+- Provider URL imports prefer a browser UA before client UAs, cap downloads at 16 MiB, and reject private/reserved targets and redirects before changing runtime config.
+- Clash/Mihomo YAML is validated directly. Other common subscription formats use pinned Sub-Store `proxy-utils` 2.36.7 in a no-network, `nobody` child process and are validated as Mihomo YAML after conversion.
+- Imported content is persisted as Mihomo's local provider cache. New managed providers retain the original URL in `x-source-url` and refresh through an authenticated `DIRECT` loopback endpoint so every update repeats safe fetch and conversion.
 - Provider and SOCKS mutations are serialized, written atomically, and rolled back on validation/restart or cache-removal failure.
 - Orphan YAML files, including non-ASCII and whitespace filenames, have opaque IDs and can be deleted exactly after backup.
 - Provider API responses redact subscription paths, queries, and tokens; the panel renders provider-controlled values with DOM text nodes.
@@ -18,7 +19,7 @@ Mihomo Gateway installs an authenticated public SOCKS5 gateway with a MetaCubeXD
 
 ## Verification
 
-- `python -m unittest discover -s tests -v`: 47 tests passing.
+- `python -m unittest discover -s tests -v`: 62 tests passing after final fixes.
 - `python -m py_compile panel/app.py scripts/render-config.py`: passing.
 - `bash -n bootstrap.sh install.sh uninstall.sh scripts/common.sh scripts/mihomo-gateway`: passing with Git Bash.
 - Extracted injected JavaScript parses with Node.js.
@@ -28,15 +29,13 @@ Mihomo Gateway installs an authenticated public SOCKS5 gateway with a MetaCubeXD
 
 ## Pending
 
-- GitHub repository `gthubtom1/mihomo-gateway` is public and the management API is deployed through commit `760b609`.
-- The target VPS was backed up and installed through the public curl-pipe bootstrap. Existing Nginx and Docker services remained active.
-- Two local YAML files were normalized into static providers with 171 and 20 nodes. AUTO has 191 candidates and GPT has 60; neither automatic group selects `DIRECT` while providers exist.
-- A panel-added HTTPS provider now imports through the verified SOCKS fallback when direct requests are blocked. It cached 20 nodes, and Mihomo's own provider refresh returned HTTP 204.
-- Authenticated SOCKS egress uses an airport exit, temporary SOCKS create/delete passed, the public panel returned the injected UI, and a GPT-routed request reached the target HTTP service.
-- Replace the static providers with panel-managed subscription URLs when the operator has the original URLs; static YAML cannot update itself.
+- The multi-format converter is hot-deployed with pinned Node 20.19.5 and Sub-Store `proxy-utils` 2.36.7; local and remote SHA256 values match.
+- Live validation passed with one managed 41-node provider refresh and one 171-node static snapshot seeded from a short-lived extraction URL.
+- Mihomo config validation, API/Mihomo/Nginx service health, AUTO/GPT exclusion of `DIRECT`, and authenticated GPT-routed SOCKS access to the OpenAI API all passed.
+- Existing provider caches were retained. The short-lived source cannot update automatically after expiry; replace it with a stable subscription URL when available.
 - Configure HTTPS or restrict the panel network path before treating management credentials as protected in transit.
 - Pin/audit the Mihomo, MetaCubeXD, and repository refs for a reproducible release; defaults currently track upstream/latest branches for one-click updates.
 
 ## Next Session First Step
 
-Add the remaining original subscription URL, verify its node count and refresh, then delete each matching static provider to remove duplicate nodes.
+Configure HTTPS for the public panel, then pin and audit the remaining mutable upstream download references.

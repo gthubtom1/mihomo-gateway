@@ -5,6 +5,7 @@ One-click Mihomo (Clash.Meta) public SOCKS5 gateway for VPS, with MetaCubeXD pan
 ## Features
 
 - Convert airport subscriptions into public authenticated SOCKS5 endpoints
+- Accept Clash/Mihomo YAML plus common Base64, URI, Surge, Quantumult, and similar subscription formats through a pinned Sub-Store parser
 - Multi-group routing: AUTO / GPT / region groups
 - MetaCubeXD dashboard on port 9090
 - Sidebar tools: create/delete SOCKS5 ports, add/delete subscription URLs
@@ -71,6 +72,10 @@ Left sidebar **SOCKS5**:
 - create/delete public SOCKS5 ports
 - add/delete airport subscription URLs (writes providers and reloads)
 
+Managed URL providers refresh through the local API, which safely fetches the original URL and serves converted Mihomo YAML back to the core. Common `ss`, `ssr`, `vmess`, `vless`, `trojan`, Hysteria, TUIC, and AnyTLS-style inputs are supported by the bundled parser version. Provider-specific encrypted formats, browser login/CAPTCHA flows, and expired or IP-blocked tokens still require a valid compatible URL from the airport.
+
+Short-lived extraction URLs can seed the cache, but they cannot update after they expire. Use a stable subscription URL for automatic refresh, or keep the imported cache as a static provider snapshot.
+
 ## Commands
 
 ```bash
@@ -95,6 +100,8 @@ bash uninstall.sh
 - Enable HTTPS and firewall restrictions before heavy public use
 
 See [docs/SECURITY.md](docs/SECURITY.md).
+
+Third-party runtime components and pinned versions are listed in [THIRD_PARTY.md](THIRD_PARTY.md).
 
 ## License
 

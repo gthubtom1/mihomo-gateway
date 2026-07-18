@@ -3,6 +3,7 @@ import argparse
 import json
 import re
 import secrets
+import sys
 from pathlib import Path
 
 import yaml
@@ -43,7 +44,8 @@ def main():
     args = ap.parse_args()
 
     if args.emit_sub_urls is not None:
-        for name, url in parse_sub_urls(args.emit_sub_urls):
+        raw_sub_urls = sys.stdin.read() if args.emit_sub_urls == "-" else args.emit_sub_urls
+        for name, url in parse_sub_urls(raw_sub_urls):
             print(json.dumps({"name": name, "url": url}, ensure_ascii=False))
         return
 
