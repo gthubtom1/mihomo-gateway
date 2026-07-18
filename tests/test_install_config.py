@@ -88,6 +88,11 @@ class InstallConfigTests(unittest.TestCase):
             for group in cfg["proxy-groups"]:
                 if "use" in group:
                     self.assertEqual([], group["use"], group["name"])
+                    self.assertEqual("REJECT", group["empty-fallback"], group["name"])
+                self.assertNotIn("DIRECT", group.get("proxies") or [], group["name"])
+                if group.get("url"):
+                    self.assertEqual("https://api.openai.com/v1/models", group["url"])
+                    self.assertEqual(401, group["expected-status"])
             self.assertFalse((root / "custom.yaml").exists())
 
     def test_sub_url_parser_preserves_named_and_generated_names(self):
@@ -107,7 +112,110 @@ class InstallConfigTests(unittest.TestCase):
     def test_installer_imports_subscriptions_only_after_services_are_active(self):
         source = INSTALL_SH.read_text(encoding="utf-8")
         self.assertLess(source.index("start_services"), source.index("import_initial_subscriptions"))
-        self.assertLess(source.index("import_initial_subscriptions"), source.index("print_summary"))
+        self.assertLess(source.index("import_initial_subscriptions"), source.index("migrate_initial_socks"))
+        self.assertLess(source.index("migrate_initial_socks"), source.index("print_summary"))
+
+    def test_cli_and_installer_support_independent_socks_migration(self):
+        common = COMMON_SH.read_text(encoding="utf-8")
+        gateway_cli = GATEWAY_CLI.read_text(encoding="utf-8")
+
+        self.assertIn("migrate_initial_socks()", common)
+        self.assertIn('[[ -n "${SUB_URLS:-}" ]] || return 0', common)
+        self.assertIn("mihomo-gateway socks migrate", common)
+        self.assertIn('migrate) api POST /panel-api/socks/migrate', gateway_cli)
+
+    def test_existing_install_uses_in_place_upgrade_before_destructive_steps(self):
+        install = INSTALL_SH.read_text(encoding="utf-8")
+        common = COMMON_SH.read_text(encoding="utf-8")
+
+        self.assertIn("has_existing_state", install)
+        self.assertIn("upgrade_existing_install", install)
+        self.assertLess(install.index("upgrade_existing_install"), install.index("render_runtime_config"))
+        self.assertIn("upgrade_existing_install()", common)
+        self.assertIn('cp -a -- "${RUNTIME_ROOT}/config.yaml"', common)
+        self.assertIn('"${backup_dir}/providers"', common)
+        self.assertIn('convert-subscription.mjs', common)
+        self.assertIn("mihomo-gateway socks migrate", common)
+        self.assertIn("restore_existing_upgrade", common)
+
+    def test_existing_install_detection_uses_persistent_state_not_panel_files(self):
+        common = COMMON_SH.read_text(encoding="utf-8")
+        install = INSTALL_SH.read_text(encoding="utf-8")
+
+        self.assertIn("has_existing_state()", common)
+        self.assertIn("partial existing installation", common)
+        self.assertLess(install.index("has_existing_state"), install.index("detect_public_ip"))
+
+    @unittest.skipUnless(BASH, "bash is required to verify upgrade rollback")
+    def test_existing_upgrade_restores_runtime_and_provider_files_on_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            install_root = root / "opt"
+            runtime_root = root / "etc"
+            state_root = root / "state"
+            backup_root = root / "backups"
+            cli = root / "bin" / "mihomo-gateway"
+            panel = install_root / "panel"
+            providers = runtime_root / "providers"
+            ui = runtime_root / "ui"
+            for directory in (panel, providers, ui, state_root, cli.parent):
+                directory.mkdir(parents=True, exist_ok=True)
+            fixtures = {
+                runtime_root / "config.yaml": "old-config\n",
+                panel / "app.py": "old-app\n",
+                panel / "inject.html": "old-inject\n",
+                panel / "convert-subscription.mjs": "old-converter\n",
+                providers / "airport.yaml": "old-provider\n",
+                ui / "index.html": "old-ui\n",
+                ui / "config.js": "old-config-js\n",
+                cli: "old-cli\n",
+                state_root / "env": "MIHOMO_SECRET=test-secret\n",
+            }
+            for path, content in fixtures.items():
+                path.write_text(content, encoding="utf-8")
+
+            script = f"""
+source '{COMMON_SH.as_posix()}'
+INSTALL_ROOT='{install_root.as_posix()}'
+RUNTIME_ROOT='{runtime_root.as_posix()}'
+STATE_ROOT='{state_root.as_posix()}'
+BACKUP_ROOT='{backup_root.as_posix()}'
+ENV_FILE='{(state_root / 'env').as_posix()}'
+GATEWAY_CLI_PATH='{cli.as_posix()}'
+
+install_panel_api() {{
+  printf 'new-app\n' > "$INSTALL_ROOT/panel/app.py"
+  printf 'new-inject\n' > "$INSTALL_ROOT/panel/inject.html"
+  printf 'new-converter\n' > "$INSTALL_ROOT/panel/convert-subscription.mjs"
+  printf 'new-cli\n' > "$GATEWAY_CLI_PATH"
+  printf 'new-provider\n' > "$RUNTIME_ROOT/providers/airport.yaml"
+  printf 'new-ui\n' > "$RUNTIME_ROOT/ui/index.html"
+  printf 'new-config-js\n' > "$RUNTIME_ROOT/ui/config.js"
+  printf 'new-asset\n' > "$RUNTIME_ROOT/ui/new-asset.js"
+}}
+python3() {{ return 0; }}
+mihomo() {{ return 0; }}
+systemctl() {{ return 0; }}
+mihomo-gateway() {{ return 1; }}
+
+set +e
+( upgrade_existing_install ) >/dev/null 2>&1
+upgrade_status=$?
+set -e
+[[ $upgrade_status -ne 0 ]]
+[[ "$(cat "$RUNTIME_ROOT/config.yaml")" == 'old-config' ]]
+[[ "$(cat "$INSTALL_ROOT/panel/app.py")" == 'old-app' ]]
+[[ "$(cat "$INSTALL_ROOT/panel/inject.html")" == 'old-inject' ]]
+[[ "$(cat "$INSTALL_ROOT/panel/convert-subscription.mjs")" == 'old-converter' ]]
+[[ "$(cat "$RUNTIME_ROOT/providers/airport.yaml")" == 'old-provider' ]]
+[[ "$(cat "$RUNTIME_ROOT/ui/index.html")" == 'old-ui' ]]
+[[ "$(cat "$RUNTIME_ROOT/ui/config.js")" == 'old-config-js' ]]
+[[ ! -e "$RUNTIME_ROOT/ui/new-asset.js" ]]
+[[ "$(cat "$GATEWAY_CLI_PATH")" == 'old-cli' ]]
+"""
+            result = subprocess.run([BASH, "-c", script], capture_output=True, text=True)
+
+            self.assertEqual(0, result.returncode, result.stdout + result.stderr)
 
     def test_installer_keeps_subscription_urls_out_of_child_argv(self):
         common = COMMON_SH.read_text(encoding="utf-8")

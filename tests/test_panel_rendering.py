@@ -25,6 +25,20 @@ class PanelProviderRenderingTests(unittest.TestCase):
         self.assertIn("document.createElement('tr')", self.socks_renderer)
         self.assertIn("textContent", self.socks_renderer)
 
+    def test_independent_egress_controls_and_status_are_rendered(self):
+        self.assertIn('id="mx-migrate"', self.source)
+        self.assertIn("/panel-api/socks/migrate", self.source)
+        self.assertIn("s.primary || '-'", self.socks_renderer)
+        self.assertIn("s.mode || 'legacy'", self.socks_renderer)
+
+    def test_socks_route_survives_metacubexd_hash_normalization(self):
+        self.assertIn("const SOCKS_ROUTE = '#/overview?gateway=socks5'", self.source)
+        self.assertIn("function isSocksHash()", self.source)
+        self.assertIn("location.hash === '#/socks5'", self.source)
+        self.assertIn("a.setAttribute('href', SOCKS_ROUTE)", self.source)
+        self.assertIn("history.replaceState(null, '', SOCKS_ROUTE)", self.source)
+        self.assertNotIn("location.hash === '#socks5') showSocks()", self.source)
+
     def test_provider_rows_use_dom_text_rendering_without_raw_urls(self):
         self.assertNotIn("innerHTML", self.provider_renderer)
         self.assertNotRegex(self.provider_renderer, re.compile(r"\$\{\s*p\."))

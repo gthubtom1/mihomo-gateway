@@ -36,6 +36,10 @@ PROVIDER_REFRESH_LOCKS = {}
 MAX_API_BODY = 64 * 1024
 MAX_SUBSCRIPTION_BODY = 16 * 1024 * 1024
 MAX_CONVERTED_BODY = 32 * 1024 * 1024
+MANAGED_GROUP_PREFIX = "MGW-"
+HEALTH_CHECK_URL = "https://api.openai.com/v1/models"
+HEALTH_CHECK_INTERVAL = 60
+HEALTH_CHECK_EXPECTED_STATUS = 401
 CONVERTER_WRAPPER = Path(os.environ.get(
     "SUBSTORE_CONVERTER_WRAPPER",
     str(Path(__file__).resolve().with_name("convert-subscription.mjs")),
@@ -554,8 +558,331 @@ def _backup_provider_file(path):
     return target
 
 
+def _group_index(cfg):
+    return {
+        group.get("name"): group
+        for group in (cfg.get("proxy-groups") or [])
+        if isinstance(group, dict) and group.get("name")
+    }
+
+
+def _is_managed_group_name(name):
+    return isinstance(name, str) and name.startswith(MANAGED_GROUP_PREFIX)
+
+
+def _managed_route_name(port):
+    return f"{MANAGED_GROUP_PREFIX}{int(port)}"
+
+
+def _encode_group_name(name):
+    token = base64.urlsafe_b64encode(str(name).encode("utf-8")).decode("ascii").rstrip("=")
+    if not token or len(token) > 120:
+        raise RuntimeError("source group name is too long for independent routing")
+    return token
+
+
+def _decode_group_name(token):
+    try:
+        padding = "=" * (-len(token) % 4)
+        return base64.urlsafe_b64decode(token + padding).decode("utf-8")
+    except Exception:
+        return ""
+
+
+def _managed_group_names(port, source_group):
+    route = _managed_route_name(port)
+    token = _encode_group_name(source_group)
+    return route, f"{route}-P-{token}", f"{route}-B-{token}"
+
+
+def _source_group_from_primary_name(name):
+    match = re.fullmatch(rf"{re.escape(MANAGED_GROUP_PREFIX)}\d+-P-([A-Za-z0-9_-]+)", str(name or ""))
+    return _decode_group_name(match.group(1)) if match else ""
+
+
 def group_names(cfg):
-    return [g.get("name") for g in (cfg.get("proxy-groups") or []) if g.get("name")]
+    return [
+        group.get("name")
+        for group in (cfg.get("proxy-groups") or [])
+        if group.get("name") and not _is_managed_group_name(group.get("name"))
+    ]
+
+
+def _configured_provider_proxy_nodes(cfg, provider_names):
+    providers = cfg.get("proxy-providers") or {}
+    names = []
+    seen = set()
+    for provider_name in provider_names:
+        provider = providers.get(provider_name)
+        if not isinstance(provider, dict):
+            continue
+        try:
+            path = _provider_path(provider_name, provider)
+            data = yaml.safe_load(path.read_text(encoding="utf-8-sig")) or {}
+        except (OSError, RuntimeError, yaml.YAMLError):
+            continue
+        proxies = data.get("proxies") if isinstance(data, dict) else None
+        if not isinstance(proxies, list):
+            continue
+        for proxy in proxies:
+            name = proxy.get("name") if isinstance(proxy, dict) else None
+            identity = (provider_name, name)
+            if not isinstance(name, str) or not name or name == "DIRECT" or identity in seen:
+                continue
+            seen.add(identity)
+            names.append(identity)
+    return names
+
+
+def _provider_group_spec(cfg, source_group, seen=None, selected_groups=None):
+    groups = _group_index(cfg)
+    group = groups.get(source_group)
+    if not group or _is_managed_group_name(source_group):
+        raise RuntimeError(f"group not found: {source_group}")
+    seen = set(seen or ())
+    if source_group in seen:
+        raise RuntimeError(f"group cycle: {source_group}")
+    seen.add(source_group)
+
+    providers = cfg.get("proxy-providers") or {}
+    use = [name for name in (group.get("use") or []) if name in providers]
+    children = list(group.get("proxies") or [])
+    selected = (selected_groups or {}).get(source_group)
+    if group.get("type") == "select" and selected:
+        if selected in {"DIRECT", "REJECT"}:
+            raise RuntimeError(f"selected group has no provider nodes: {source_group}")
+        if selected in groups and not _is_managed_group_name(selected):
+            try:
+                return _provider_group_spec(
+                    cfg,
+                    selected,
+                    seen,
+                    selected_groups=selected_groups,
+                )
+            except RuntimeError:
+                pass
+    if use:
+        spec = {
+            "source": source_group,
+            "use": use,
+            "filter": group.get("filter") or "",
+            "exclude-filter": group.get("exclude-filter") or "",
+        }
+        selected_matches = [
+            identity for identity in _configured_provider_proxy_nodes(cfg, use)
+            if identity[1] == selected
+            and _matches_group_filter(identity[1], spec["filter"], spec["exclude-filter"])
+        ]
+        if selected_matches:
+            spec["preferred"] = selected
+        return spec
+
+    if group.get("type") == "select" and selected:
+        children = [selected] + [child for child in children if child != selected]
+    for child in children:
+        if child in groups and not _is_managed_group_name(child):
+            try:
+                return _provider_group_spec(
+                    cfg,
+                    child,
+                    seen,
+                    selected_groups=selected_groups,
+                )
+            except RuntimeError:
+                continue
+    raise RuntimeError(f"group has no provider nodes: {source_group}")
+
+
+def _matches_group_filter(name, include, exclude):
+    try:
+        if include and re.search(include, name) is None:
+            return False
+        if exclude and re.search(exclude, name) is not None:
+            return False
+    except re.error as e:
+        raise RuntimeError(f"invalid group filter: {e}") from e
+    return True
+
+
+def _eligible_proxy_nodes(cfg, spec, healthy_names=None):
+    candidates = [
+        identity for identity in _configured_provider_proxy_nodes(cfg, spec["use"])
+        if _matches_group_filter(identity[1], spec["filter"], spec["exclude-filter"])
+    ]
+    if healthy_names is not None:
+        candidates = [
+            identity for identity in candidates
+            if identity in healthy_names or identity[1] in healthy_names
+        ]
+    return candidates
+
+
+def _managed_listener_info(cfg, listener):
+    port = int(listener.get("port") or 0)
+    route_name = listener.get("proxy")
+    if route_name != _managed_route_name(port):
+        return None
+    groups = _group_index(cfg)
+    route = groups.get(route_name)
+    route_proxies = route.get("proxies") if isinstance(route, dict) else None
+    if not isinstance(route_proxies, list) or len(route_proxies) < 2:
+        return None
+    primary_group = groups.get(route_proxies[0])
+    if not isinstance(primary_group, dict):
+        return None
+    primary_filter = primary_group.get("filter") or ""
+    matches = [
+        identity for identity in _configured_provider_proxy_nodes(
+            cfg,
+            primary_group.get("use") or [],
+        )
+        if _matches_group_filter(identity[1], primary_filter, "")
+    ]
+    primary_identity = matches[0] if len(matches) == 1 else None
+    return {
+        "mode": "independent",
+        "route": route_name,
+        "source_group": _source_group_from_primary_name(route_proxies[0]),
+        "primary": primary_identity[1] if primary_identity else "",
+        "primary_provider": primary_identity[0] if primary_identity else "",
+        "primary_id": primary_identity,
+    }
+
+
+def _assigned_primary_nodes(cfg):
+    assigned = []
+    for listener in cfg.get("listeners") or []:
+        if listener.get("type") != "socks":
+            continue
+        info = _managed_listener_info(cfg, listener)
+        if info and info["primary_id"]:
+            assigned.append(info["primary_id"])
+    return assigned
+
+
+def _regex_escape_literal(value):
+    return re.sub(r"([\\.+*?()\[\]{}^$|])", r"\\\1", str(value))
+
+
+def _combined_exclude_filter(original, primary):
+    exact = rf"^({_regex_escape_literal(primary)})$"
+    if not original:
+        return exact
+    flag_match = re.match(r"^\(\?([imsU-]+)\)", original)
+    if not flag_match:
+        return f"({original})|({exact})"
+    flags = flag_match.group(0)
+    body = original[len(flags):]
+    return f"{flags}({body})|({exact})"
+
+
+def _add_independent_groups(
+    cfg,
+    port,
+    source_group,
+    healthy_names=None,
+    selected_groups=None,
+):
+    try:
+        spec = _provider_group_spec(
+            cfg,
+            source_group,
+            selected_groups=selected_groups,
+        )
+    except RuntimeError as e:
+        if "no provider nodes" not in str(e):
+            raise
+        raise RuntimeError(f"group has no eligible provider node: {source_group}") from e
+    candidates = _eligible_proxy_nodes(cfg, spec, healthy_names=healthy_names)
+    if not candidates:
+        qualifier = "healthy " if healthy_names is not None else ""
+        raise RuntimeError(f"group has no eligible {qualifier}provider node: {source_group}")
+    if len(candidates) < 2 or len({identity[1] for identity in candidates}) < 2:
+        raise RuntimeError(
+            f"independent routing requires at least two eligible provider nodes: {source_group}"
+        )
+
+    preferred = spec.get("preferred")
+    if preferred:
+        candidates = sorted(candidates, key=lambda identity: identity[1] != preferred)
+    assigned = set(_assigned_primary_nodes(cfg))
+    primary_identity = next(
+        (
+            identity for identity in candidates
+            if identity not in assigned
+            and any(other[1] != identity[1] for other in candidates)
+        ),
+        None,
+    )
+    if primary_identity is None:
+        raise RuntimeError(
+            f"no distinct healthy primary provider node remains: {source_group}"
+        )
+    primary_provider, primary = primary_identity
+
+    route_name, primary_name, backup_name = _managed_group_names(port, source_group)
+    existing_names = set(_group_index(cfg))
+    collisions = existing_names.intersection({route_name, primary_name, backup_name})
+    if collisions:
+        raise RuntimeError(f"managed group exists: {sorted(collisions)[0]}")
+
+    cfg.setdefault("proxy-groups", []).extend([
+        {
+            "name": primary_name,
+            "type": "url-test",
+            "use": [primary_provider],
+            "filter": rf"^({_regex_escape_literal(primary)})$",
+            "empty-fallback": "REJECT",
+            "url": HEALTH_CHECK_URL,
+            "interval": HEALTH_CHECK_INTERVAL,
+            "expected-status": HEALTH_CHECK_EXPECTED_STATUS,
+            "tolerance": 0,
+            "lazy": True,
+        },
+        {
+            "name": backup_name,
+            "type": "fallback",
+            "use": spec["use"],
+            "empty-fallback": "REJECT",
+            "url": HEALTH_CHECK_URL,
+            "interval": HEALTH_CHECK_INTERVAL,
+            "expected-status": HEALTH_CHECK_EXPECTED_STATUS,
+            "lazy": True,
+            **({"filter": spec["filter"]} if spec["filter"] else {}),
+            "exclude-filter": _combined_exclude_filter(spec["exclude-filter"], primary),
+        },
+        {
+            "name": route_name,
+            "type": "fallback",
+            "proxies": [primary_name, backup_name],
+            "empty-fallback": "REJECT",
+            "url": HEALTH_CHECK_URL,
+            "interval": HEALTH_CHECK_INTERVAL,
+            "expected-status": HEALTH_CHECK_EXPECTED_STATUS,
+            "lazy": True,
+        },
+    ])
+    return {
+        "mode": "independent",
+        "route": route_name,
+        "source_group": source_group,
+        "primary": primary,
+        "primary_provider": primary_provider,
+        "reused": False,
+    }
+
+
+def _managed_groups_for_listener(cfg, listener):
+    info = _managed_listener_info(cfg, listener)
+    if not info:
+        return set()
+    groups = _group_index(cfg)
+    route = groups.get(info["route"]) or {}
+    owned = {info["route"]}
+    for name in route.get("proxies") or []:
+        if _is_managed_group_name(name):
+            owned.add(name)
+    return owned
 
 
 def list_socks(cfg):
@@ -567,10 +894,15 @@ def list_socks(cfg):
         user = (users[0] or {}).get("username", "") if users else ""
         pw = (users[0] or {}).get("password", "") if users else ""
         port = lis.get("port")
+        managed = _managed_listener_info(cfg, lis)
         rows.append({
             "name": lis.get("name"),
             "port": port,
-            "group": lis.get("proxy"),
+            "group": managed["source_group"] if managed else lis.get("proxy"),
+            "route": managed["route"] if managed else lis.get("proxy"),
+            "mode": managed["mode"] if managed else "legacy",
+            "primary": managed["primary"] if managed else "",
+            "primary_provider": managed["primary_provider"] if managed else "",
             "user": user,
             "password": pw,
             "url": f"socks5://{user}:{pw}@{HOST_PUBLIC}:{port}" if user and pw and port else "",
@@ -641,6 +973,73 @@ def validate_and_restart():
     raise RuntimeError(f"mihomo did not become ready after restart: {last_error}")
 
 
+def runtime_proxy_state():
+    if not MIHOMO_SECRET:
+        return None
+    try:
+        headers = {"Authorization": f"Bearer {MIHOMO_SECRET}"}
+        group_request = urllib.request.Request(
+            "http://127.0.0.1:9091/proxies",
+            headers=headers,
+        )
+        provider_request = urllib.request.Request(
+            "http://127.0.0.1:9091/providers/proxies",
+            headers=headers,
+        )
+        with urllib.request.urlopen(group_request, timeout=3) as response:
+            group_payload = json.loads(response.read().decode("utf-8")) or {}
+        with urllib.request.urlopen(provider_request, timeout=3) as response:
+            provider_payload = json.loads(response.read().decode("utf-8")) or {}
+        groups = group_payload.get("proxies") if isinstance(group_payload, dict) else None
+        providers = provider_payload.get("providers") if isinstance(provider_payload, dict) else None
+        if not isinstance(groups, dict) or not isinstance(providers, dict):
+            return None
+        healthy = {
+            (provider_name, proxy.get("name"))
+            for provider_name, provider in providers.items()
+            if isinstance(provider, dict)
+            for proxy in (provider.get("proxies") or [])
+            if isinstance(proxy, dict)
+            and isinstance(proxy.get("name"), str)
+            and proxy.get("alive") is True
+        }
+        selected = {
+            name: info.get("now") for name, info in groups.items()
+            if isinstance(info, dict) and isinstance(info.get("now"), str) and info.get("now")
+        }
+        return {"healthy": healthy, "selected": selected}
+    except Exception:
+        return None
+
+
+def refresh_runtime_provider_health(cfg):
+    if not MIHOMO_SECRET:
+        raise RuntimeError("mihomo management secret unavailable")
+    headers = {"Authorization": f"Bearer {MIHOMO_SECRET}"}
+    for name in (cfg.get("proxy-providers") or {}):
+        request = urllib.request.Request(
+            "http://127.0.0.1:9091/providers/proxies/"
+            + quote(name, safe="")
+            + "/healthcheck",
+            headers=headers,
+        )
+        with urllib.request.urlopen(request, timeout=120) as response:
+            if getattr(response, "status", 200) not in {200, 204}:
+                raise RuntimeError(f"provider health check failed: {name}")
+
+
+def require_runtime_proxy_state(refresh=False):
+    if refresh:
+        try:
+            refresh_runtime_provider_health(load_cfg())
+        except Exception as e:
+            raise RuntimeError(f"mihomo provider health refresh failed: {e}") from e
+    state = runtime_proxy_state()
+    if state is None:
+        raise RuntimeError("mihomo proxy health status unavailable; no changes were made")
+    return state
+
+
 def _ufw_status():
     try:
         return subprocess.check_output(["ufw", "status"], text=True)
@@ -685,7 +1084,79 @@ def default_auth(listeners):
     return f"socks_{secrets.token_hex(3)}", secrets.token_urlsafe(18)
 
 
-def add_socks(port, group, name=None, user=None, password=None):
+def _ensure_provider_health_checks(cfg):
+    changed = False
+    for provider in (cfg.get("proxy-providers") or {}).values():
+        if not isinstance(provider, dict):
+            continue
+        health = provider.setdefault("health-check", {})
+        expected = {
+            "enable": True,
+            "interval": HEALTH_CHECK_INTERVAL,
+            "url": HEALTH_CHECK_URL,
+            "expected-status": HEALTH_CHECK_EXPECTED_STATUS,
+            "lazy": False,
+        }
+        for key, value in expected.items():
+            if health.get(key) != value:
+                health[key] = value
+                changed = True
+    for group in cfg.get("proxy-groups") or []:
+        if isinstance(group, dict) and isinstance(group.get("use"), list):
+            if group.get("empty-fallback") != "REJECT":
+                group["empty-fallback"] = "REJECT"
+                changed = True
+        if not isinstance(group, dict):
+            continue
+        is_provider_group = isinstance(group.get("use"), list)
+        is_managed_group = _is_managed_group_name(group.get("name"))
+        if (is_provider_group or is_managed_group) and group.get("type") in {"url-test", "fallback"}:
+            expected = {
+                "url": HEALTH_CHECK_URL,
+                "interval": HEALTH_CHECK_INTERVAL,
+                "expected-status": HEALTH_CHECK_EXPECTED_STATUS,
+                "empty-fallback": "REJECT",
+            }
+            for key, value in expected.items():
+                if group.get(key) != value:
+                    group[key] = value
+                    changed = True
+    return changed
+
+
+def with_fresh_proxy_state(action):
+    with MUTATION_LOCK:
+        original_config = CONFIG.read_bytes()
+        cfg = load_cfg()
+        health_changed = _ensure_provider_health_checks(cfg)
+        try:
+            if health_changed:
+                save_cfg(cfg)
+                validate_and_restart()
+            state = require_runtime_proxy_state(refresh=True)
+            return action(state)
+        except Exception as operation_error:
+            if not health_changed:
+                raise
+            _restore_config(original_config)
+            try:
+                validate_and_restart()
+            except Exception as rollback_error:
+                raise RuntimeError(
+                    f"operation failed and rollback restart failed: {rollback_error}"
+                ) from operation_error
+            raise
+
+
+def add_socks(
+    port,
+    group,
+    name=None,
+    user=None,
+    password=None,
+    healthy_names=None,
+    selected_groups=None,
+):
     with MUTATION_LOCK:
         cfg = load_cfg()
         original_config = CONFIG.read_bytes()
@@ -706,27 +1177,37 @@ def add_socks(port, group, name=None, user=None, password=None):
         duser, dpw = default_auth(listeners)
         user = user or duser
         password = password or dpw
+        _ensure_provider_health_checks(cfg)
+        routing = _add_independent_groups(
+            cfg,
+            port,
+            group,
+            healthy_names=healthy_names,
+            selected_groups=selected_groups,
+        )
         listeners.append({
             "name": name,
             "type": "socks",
             "port": port,
             "listen": "0.0.0.0",
             "users": [{"username": user, "password": password}],
-            "proxy": group,
+            "proxy": routing["route"],
         })
         firewall_changed = False
         try:
             save_cfg(cfg)
             validate_and_restart()
             firewall_changed = ufw_allow(port)
-        except Exception:
+        except Exception as operation_error:
             _restore_config(original_config)
             try:
                 validate_and_restart()
                 if firewall_changed:
                     ufw_delete(port)
-            except Exception:
-                pass
+            except Exception as rollback_error:
+                raise RuntimeError(
+                    f"SOCKS5 creation failed and rollback restart failed: {rollback_error}"
+                ) from operation_error
             raise
         return {
             "name": name,
@@ -735,7 +1216,53 @@ def add_socks(port, group, name=None, user=None, password=None):
             "user": user,
             "password": password,
             "url": f"socks5://{user}:{password}@{HOST_PUBLIC}:{port}",
+            **routing,
         }
+
+
+def migrate_socks(healthy_names=None, selected_groups=None):
+    with MUTATION_LOCK:
+        cfg = load_cfg()
+        original_config = CONFIG.read_bytes()
+        migrated = []
+        skipped = 0
+        config_changed = _ensure_provider_health_checks(cfg)
+        listeners = sorted(
+            (row for row in (cfg.get("listeners") or []) if row.get("type") == "socks"),
+            key=lambda row: int(row.get("port") or 0),
+        )
+        for listener in listeners:
+            managed = _managed_listener_info(cfg, listener)
+            if managed:
+                skipped += 1
+                continue
+            else:
+                source_group = listener.get("proxy")
+            routing = _add_independent_groups(
+                cfg,
+                int(listener.get("port") or 0),
+                source_group,
+                healthy_names=healthy_names,
+                selected_groups=selected_groups,
+            )
+            listener["proxy"] = routing["route"]
+            migrated.append(routing)
+
+        if not migrated and not config_changed:
+            return {"migrated": 0, "skipped": skipped, "socks": list_socks(cfg)}
+        try:
+            save_cfg(cfg)
+            validate_and_restart()
+        except Exception as migration_error:
+            _restore_config(original_config)
+            try:
+                validate_and_restart()
+            except Exception as rollback_error:
+                raise RuntimeError(
+                    f"migration failed and rollback restart failed: {rollback_error}"
+                ) from migration_error
+            raise
+        return {"migrated": len(migrated), "skipped": skipped, "socks": list_socks(cfg)}
 
 
 def del_socks(port=None, name=None):
@@ -758,6 +1285,12 @@ def del_socks(port=None, name=None):
         if not removed:
             raise RuntimeError("not found")
         cfg["listeners"] = kept
+        owned_groups = _managed_groups_for_listener(cfg, removed)
+        if owned_groups:
+            cfg["proxy-groups"] = [
+                group for group in (cfg.get("proxy-groups") or [])
+                if group.get("name") not in owned_groups
+            ]
         removed_port = int(removed["port"]) if removed.get("port") is not None else None
         firewall_changed = False
         try:
@@ -765,27 +1298,36 @@ def del_socks(port=None, name=None):
             validate_and_restart()
             if removed_port is not None:
                 firewall_changed = ufw_delete(removed_port)
-        except Exception:
+        except Exception as operation_error:
             _restore_config(original_config)
             try:
                 validate_and_restart()
                 if removed_port is not None and firewall_changed:
                     ufw_allow(removed_port)
-            except Exception:
-                pass
+            except Exception as rollback_error:
+                raise RuntimeError(
+                    f"SOCKS5 deletion failed and rollback restart failed: {rollback_error}"
+                ) from operation_error
             raise
         return removed
 
 
 def attach_provider_to_groups(cfg, provider_name):
     for g in cfg.get("proxy-groups") or []:
+        if _is_managed_group_name(g.get("name")):
+            continue
         use = g.get("use")
         if not isinstance(use, list):
             continue
         if provider_name not in use:
             use.append(provider_name)
             g["use"] = use
-        if g.get("type") in {"url-test", "fallback"} and g.get("proxies") == ["DIRECT"]:
+        g["empty-fallback"] = "REJECT"
+        if g.get("type") in {"url-test", "fallback"}:
+            g["url"] = HEALTH_CHECK_URL
+            g["interval"] = HEALTH_CHECK_INTERVAL
+            g["expected-status"] = HEALTH_CHECK_EXPECTED_STATUS
+        if g.get("proxies") in (["DIRECT"], ["REJECT"]):
             g["proxies"] = []
 
 
@@ -794,8 +1336,8 @@ def detach_provider_from_groups(cfg, provider_name):
         use = g.get("use")
         if isinstance(use, list) and provider_name in use:
             g["use"] = [x for x in use if x != provider_name]
-            if not g["use"] and not g.get("proxies"):
-                g["proxies"] = ["DIRECT"]
+            if not g["use"] and g.get("proxies") in (None, [], ["DIRECT"]):
+                g["proxies"] = ["REJECT"]
 
 
 def fetch_subscription(url, timeout=25):
@@ -1079,8 +1621,10 @@ def add_provider(name, url, interval=3600):
             "header": {"X-Secret": [MIHOMO_SECRET]},
             "health-check": {
                 "enable": True,
-                "interval": 600,
-                "url": "https://www.gstatic.com/generate_204",
+                "interval": HEALTH_CHECK_INTERVAL,
+                "url": HEALTH_CHECK_URL,
+                "expected-status": HEALTH_CHECK_EXPECTED_STATUS,
+                "lazy": False,
             },
         }
         attach_provider_to_groups(cfg, name)
@@ -1088,13 +1632,15 @@ def add_provider(name, url, interval=3600):
             _atomic_write(cache_path, normalized)
             save_cfg(cfg)
             validate_and_restart()
-        except Exception:
+        except Exception as operation_error:
             _restore_config(original_config)
-            cache_path.unlink(missing_ok=True)
             try:
+                cache_path.unlink(missing_ok=True)
                 validate_and_restart()
-            except Exception:
-                pass
+            except Exception as rollback_error:
+                raise RuntimeError(
+                    f"provider creation failed and rollback restart failed: {rollback_error}"
+                ) from operation_error
             raise
         return {
             "name": name,
@@ -1134,8 +1680,10 @@ def add_static_provider(name, body):
             "path": f"./providers/{name}.yaml",
             "health-check": {
                 "enable": True,
-                "interval": 600,
-                "url": "https://www.gstatic.com/generate_204",
+                "interval": HEALTH_CHECK_INTERVAL,
+                "url": HEALTH_CHECK_URL,
+                "expected-status": HEALTH_CHECK_EXPECTED_STATUS,
+                "lazy": False,
             },
         }
         attach_provider_to_groups(cfg, name)
@@ -1143,13 +1691,15 @@ def add_static_provider(name, body):
             _atomic_write(cache_path, normalized)
             save_cfg(cfg)
             validate_and_restart()
-        except Exception:
+        except Exception as operation_error:
             _restore_config(original_config)
-            cache_path.unlink(missing_ok=True)
             try:
+                cache_path.unlink(missing_ok=True)
                 validate_and_restart()
-            except Exception:
-                pass
+            except Exception as rollback_error:
+                raise RuntimeError(
+                    f"YAML provider creation failed and rollback restart failed: {rollback_error}"
+                ) from operation_error
             raise
         return {
             "name": name,
@@ -1204,12 +1754,14 @@ def del_provider(name=None, provider_id=None):
             save_cfg(cfg)
             validate_and_restart()
             path.unlink(missing_ok=True)
-        except Exception:
+        except Exception as operation_error:
             _restore_config(original_config)
             try:
                 validate_and_restart()
-            except Exception:
-                pass
+            except Exception as rollback_error:
+                raise RuntimeError(
+                    f"provider deletion failed and rollback restart failed: {rollback_error}"
+                ) from operation_error
             raise
         return {
             "id": _resource_id("provider", name),
@@ -1300,10 +1852,21 @@ class H(BaseHTTPRequestHandler):
                 raw = self._raw_body(MAX_SUBSCRIPTION_BODY)
                 return self._json(200, add_static_provider(name, raw))
             body = self._body()
+            if u.path == "/panel-api/socks/migrate":
+                return self._json(200, with_fresh_proxy_state(
+                    lambda state: migrate_socks(
+                        healthy_names=state["healthy"],
+                        selected_groups=state["selected"],
+                    )
+                ))
             if u.path == "/panel-api/socks":
-                return self._json(200, add_socks(
-                    body.get("port"), body.get("group"),
-                    name=body.get("name"), user=body.get("user"), password=body.get("password"),
+                return self._json(200, with_fresh_proxy_state(
+                    lambda state: add_socks(
+                        body.get("port"), body.get("group"),
+                        name=body.get("name"), user=body.get("user"), password=body.get("password"),
+                        healthy_names=state["healthy"],
+                        selected_groups=state["selected"],
+                    )
                 ))
             if u.path == "/panel-api/providers":
                 return self._json(200, add_provider(

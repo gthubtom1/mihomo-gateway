@@ -5,7 +5,21 @@
 #mx-socks-page .mx-card{background:color-mix(in oklab,var(--color-base-200,#0b1220) 96%,transparent);border:1px solid color-mix(in oklab,var(--color-base-content,#fff) 10%,transparent);border-radius:14px;padding:14px;margin-bottom:12px}
 #mx-socks-page .mx-title{font-size:18px;font-weight:700;margin:0 0 12px}
 #mx-socks-page .mx-grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px}
-@media (max-width:1000px){#mx-socks-page .mx-grid{grid-template-columns:1fr 1fr}}
+#mx-socks-page .mx-secret-grid{display:grid;grid-template-columns:1fr auto auto;gap:8px;align-items:end}
+#mx-socks-page .mx-provider-url-grid{display:grid;grid-template-columns:1.2fr 2fr 1fr auto;gap:10px}
+#mx-socks-page .mx-provider-file-grid{display:grid;grid-template-columns:1fr 2fr auto;gap:10px;align-items:end;margin-top:10px}
+#mx-socks-page .mx-section-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px}
+@media (max-width:1000px){
+  #mx-socks-page .mx-grid,#mx-socks-page .mx-provider-url-grid{grid-template-columns:1fr 1fr}
+}
+@media (max-width:640px){
+  #mx-socks-page{padding:12px}
+  #mx-socks-page .mx-grid,#mx-socks-page .mx-provider-url-grid,#mx-socks-page .mx-provider-file-grid{grid-template-columns:1fr}
+  #mx-socks-page .mx-secret-grid{grid-template-columns:1fr 1fr}
+  #mx-socks-page .mx-secret-grid>div:first-child{grid-column:1/-1}
+  #mx-socks-page .mx-provider-url-grid>div:last-child button,#mx-socks-page .mx-provider-file-grid>button{width:100%}
+  #mx-socks-page .mx-section-head{align-items:flex-start;flex-wrap:wrap}
+}
 #mx-socks-page label{display:block;font-size:12px;opacity:.7;margin-bottom:6px}
 #mx-socks-page input,#mx-socks-page select{width:100%;border-radius:10px;padding:10px 12px;background:color-mix(in oklab,var(--color-base-100,#000) 90%,transparent);border:1px solid color-mix(in oklab,var(--color-base-content,#fff) 12%,transparent);color:inherit;outline:none}
 #mx-socks-page button{border:0;border-radius:10px;padding:9px 12px;cursor:pointer;font-weight:600}
@@ -26,6 +40,7 @@ a.nav-link.mx-socks-item{cursor:pointer}
 (function(){
   if (window.__MX_GATEWAY_INJECTED__) return;
   window.__MX_GATEWAY_INJECTED__ = true;
+  const SOCKS_ROUTE = '#/overview?gateway=socks5';
 
   function readStore(key){
     try{
@@ -115,7 +130,7 @@ a.nav-link.mx-socks-item{cursor:pointer}
         <div class="mx-card" id="mx-secret-card">
           <div style="font-weight:600;margin-bottom:8px">API Secret</div>
           <div style="font-size:12px;opacity:.7;margin-bottom:10px">Gateway 管理接口需要与面板相同的 Secret。优先使用设置页已保存的密钥；也可在此粘贴（仅保存在本浏览器）。</div>
-          <div style="display:grid;grid-template-columns:1fr auto auto;gap:8px;align-items:end">
+          <div class="mx-secret-grid">
             <div>
               <label>Secret</label>
               <input id="mx-secret" type="password" placeholder="paste install secret" autocomplete="off"/>
@@ -141,13 +156,13 @@ a.nav-link.mx-socks-item{cursor:pointer}
         </div>
         <div class="mx-card" id="mx-provider-card">
           <div style="font-weight:600;margin-bottom:12px">Subscription URL</div>
-          <div class="mx-grid" style="grid-template-columns:1.2fr 2fr 1fr auto;gap:10px">
+          <div class="mx-provider-url-grid">
             <div><label>Name</label><input id="mx-prov-name" placeholder="airport3"/></div>
             <div><label>URL</label><input id="mx-prov-url" placeholder="https://..."/></div>
             <div><label>Interval(sec)</label><input id="mx-prov-interval" type="number" value="3600"/></div>
             <div style="display:flex;align-items:end"><button class="btn" id="mx-prov-add" type="button">Add</button></div>
           </div>
-          <div style="display:grid;grid-template-columns:1fr 2fr auto;gap:10px;align-items:end;margin-top:10px">
+          <div class="mx-provider-file-grid">
             <div><label>Name</label><input id="mx-yaml-name" placeholder="local-yaml"/></div>
             <div><label>YAML file</label><input id="mx-prov-file" type="file" accept=".yaml,.yml,application/yaml,text/yaml"/></div>
             <button class="btn2" id="mx-prov-import" type="button">Import YAML</button>
@@ -161,10 +176,13 @@ a.nav-link.mx-socks-item{cursor:pointer}
           </div>
         </div>
         <div class="mx-card">
-          <div style="font-weight:600;margin-bottom:12px">SOCKS5 Endpoints</div>
+          <div class="mx-section-head">
+            <div style="font-weight:600">SOCKS5 Endpoints</div>
+            <button class="btn2" id="mx-migrate" type="button">Migrate existing</button>
+          </div>
           <div style="overflow:auto">
             <table>
-              <thead><tr><th>Name</th><th>Port</th><th>Group</th><th>Auth</th><th>URL</th><th></th></tr></thead>
+              <thead><tr><th>Name</th><th>Port</th><th>Group</th><th>Primary</th><th>Mode</th><th>Auth</th><th>URL</th><th></th></tr></thead>
               <tbody id="mx-tbody"></tbody>
             </table>
           </div>
@@ -174,6 +192,7 @@ a.nav-link.mx-socks-item{cursor:pointer}
     content.appendChild(page);
     page.querySelector('#mx-create').onclick = createSocks;
     page.querySelector('#mx-socks-refresh').onclick = () => { loadSocks(true); loadProviders(); };
+    page.querySelector('#mx-migrate').onclick = migrateSocks;
     page.querySelector('#mx-prov-add').onclick = addProvider;
     page.querySelector('#mx-prov-import').onclick = importProviderFile;
     page.querySelector('#mx-prov-file').onchange = event => {
@@ -247,7 +266,7 @@ a.nav-link.mx-socks-item{cursor:pointer}
       if (!rows.length){
         const row = document.createElement('tr');
         const cell = document.createElement('td');
-        cell.colSpan = 6;
+        cell.colSpan = 8;
         cell.style.opacity = '.6';
         cell.style.textAlign = 'center';
         cell.style.padding = '24px';
@@ -274,6 +293,11 @@ a.nav-link.mx-socks-item{cursor:pointer}
         addChip(addCell('', ''), s.name || '');
         addCell(s.port || '', 'mono');
         addChip(addCell('', ''), s.group || '');
+        const primary = s.primary_provider && s.primary
+          ? String(s.primary_provider) + ' / ' + String(s.primary)
+          : (s.primary || '-');
+        addCell(primary, 'mono');
+        addChip(addCell('', ''), s.mode || 'legacy');
 
         const authCell = addCell('', 'mono');
         authCell.appendChild(document.createTextNode(String(s.user || '')));
@@ -384,7 +408,7 @@ a.nav-link.mx-socks-item{cursor:pointer}
         password: document.getElementById('mx-pass').value || null,
       };
       const j = await api('/panel-api/socks', {method:'POST', body: JSON.stringify(body)});
-      setMsg('Created: ' + j.url, true);
+      setMsg('Created: ' + j.url + ' | Primary: ' + (j.primary || '-'), true);
       document.getElementById('mx-port').value = '';
       document.getElementById('mx-name').value = '';
       await loadSocks(false);
@@ -425,6 +449,19 @@ a.nav-link.mx-socks-item{cursor:pointer}
       await api('/panel-api/providers?id=' + encodeURIComponent(id), {method:'DELETE'});
       setMsg('Deleted: ' + label, true);
       await loadProviders();
+    }catch(e){ setMsg(e.message || String(e), false); }
+  }
+
+  async function migrateSocks(){
+    if (!confirm('Migrate existing SOCKS5 endpoints to independent automatic failover?')) return;
+    try{
+      setMsg('Migrating existing SOCKS5 endpoints...', true);
+      const result = await api('/panel-api/socks/migrate', {
+        method: 'POST',
+        body: JSON.stringify({}),
+      });
+      setMsg('Migrated: ' + Number(result.migrated || 0) + ' | Existing: ' + Number(result.skipped || 0), true);
+      await loadSocks(false);
     }catch(e){ setMsg(e.message || String(e), false); }
   }
 
@@ -485,6 +522,12 @@ a.nav-link.mx-socks-item{cursor:pointer}
     }
   }
 
+  function isSocksHash(){
+    return location.hash === SOCKS_ROUTE
+      || location.hash === '#socks5'
+      || location.hash === '#/socks5';
+  }
+
   function showSocks(ev){
     if (ev){ ev.preventDefault(); ev.stopPropagation(); }
     ensurePage();
@@ -506,7 +549,7 @@ a.nav-link.mx-socks-item{cursor:pointer}
     updateSecretStatus();
     loadSocks(false);
     loadProviders();
-    try { history.replaceState(null, '', '#socks5'); } catch(e){}
+    try { history.replaceState(null, '', SOCKS_ROUTE); } catch(e){}
   }
 
   function hideSocks(){
@@ -525,7 +568,7 @@ a.nav-link.mx-socks-item{cursor:pointer}
     a.id = 'mx-socks-nav';
     a.classList.add('mx-socks-item');
     a.classList.remove('is-active', 'router-link-active', 'router-link-exact-active');
-    a.setAttribute('href', '#socks5');
+    a.setAttribute('href', SOCKS_ROUTE);
     a.removeAttribute('aria-current');
     a.querySelectorAll('.nav-link__indicator').forEach(n => n.remove());
     let textSpan = null;
@@ -583,13 +626,13 @@ a.nav-link.mx-socks-item{cursor:pointer}
 
   function boot(){
     injectSidebar();
-    if (location.hash === '#socks5') showSocks();
+    if (isSocksHash()) showSocks();
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
   else boot();
   setInterval(() => { injectSidebar(); }, 1000);
   window.addEventListener('hashchange', () => {
-    if (location.hash === '#socks5') showSocks(); else hideSocks();
+    if (isSocksHash()) showSocks(); else hideSocks();
   });
 })();
 </script>

@@ -2,6 +2,7 @@ import base64
 import importlib.util
 import http.client
 import io
+import json
 import socket
 import subprocess
 import tempfile
@@ -47,6 +48,24 @@ class ProviderManagementTests(unittest.TestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def _seed_provider(self, names, provider_name="airport"):
+        cfg = gateway.load_cfg()
+        cfg["proxy-providers"][provider_name] = {
+            "type": "file",
+            "path": f"./providers/{provider_name}.yaml",
+        }
+        for group in cfg["proxy-groups"]:
+            group["use"] = [provider_name]
+        gateway.save_cfg(cfg)
+        (gateway.PROVIDERS_DIR / f"{provider_name}.yaml").write_text(
+            yaml.safe_dump(
+                {"proxies": [{"name": name, "type": "direct"} for name in names]},
+                allow_unicode=True,
+                sort_keys=False,
+            ),
+            encoding="utf-8",
+        )
 
     def test_add_provider_persists_valid_clash_yaml_and_client_header(self):
         body = yaml.safe_dump(
@@ -191,7 +210,7 @@ class ProviderManagementTests(unittest.TestCase):
 
         self.assertTrue(outside.exists())
 
-    def test_delete_legacy_last_provider_adds_direct_fallbacks(self):
+    def test_delete_legacy_last_provider_adds_reject_fallbacks(self):
         cfg = gateway.load_cfg()
         cfg["proxy-providers"]["custom"] = {
             "type": "file",
@@ -217,7 +236,10 @@ class ProviderManagementTests(unittest.TestCase):
         with mock.patch.object(gateway, "validate_and_restart", side_effect=assert_no_empty_groups):
             gateway.del_provider("custom")
 
-        self.assertNotIn("custom", gateway.load_cfg()["proxy-providers"])
+        current = gateway.load_cfg()
+        self.assertNotIn("custom", current["proxy-providers"])
+        for group in current["proxy-groups"]:
+            self.assertEqual(["REJECT"], group["proxies"])
 
     def test_first_provider_removes_direct_from_automatic_groups(self):
         cfg = gateway.load_cfg()
@@ -233,7 +255,22 @@ class ProviderManagementTests(unittest.TestCase):
         self.assertEqual([], groups["AUTO"]["proxies"])
         self.assertEqual([], groups["GPT"]["proxies"])
         self.assertEqual([], groups["故障转移"]["proxies"])
-        self.assertEqual(["DIRECT"], groups["自定义"]["proxies"])
+        self.assertEqual([], groups["自定义"]["proxies"])
+
+    def test_new_provider_does_not_expand_existing_managed_route_scope(self):
+        cfg = gateway.load_cfg()
+        cfg["proxy-groups"] = [
+            {"name": "AUTO", "type": "url-test", "use": ["old"]},
+            {"name": "MGW-1100-P-source", "type": "url-test", "use": ["old"]},
+            {"name": "MGW-1100-B-source", "type": "fallback", "use": ["old"]},
+        ]
+
+        gateway.attach_provider_to_groups(cfg, "new")
+
+        groups = {group["name"]: group for group in cfg["proxy-groups"]}
+        self.assertEqual(["old", "new"], groups["AUTO"]["use"])
+        self.assertEqual(["old"], groups["MGW-1100-P-source"]["use"])
+        self.assertEqual(["old"], groups["MGW-1100-B-source"]["use"])
 
     def test_orphan_id_cannot_delete_same_stem_configured_provider(self):
         cfg = gateway.load_cfg()
@@ -280,6 +317,7 @@ class ProviderManagementTests(unittest.TestCase):
         restart.assert_not_called()
 
     def test_add_socks_rolls_back_when_restart_fails(self):
+        self._seed_provider(["node-a", "node-b"])
         before = gateway.CONFIG.read_bytes()
         with mock.patch.object(
             gateway,
@@ -293,6 +331,438 @@ class ProviderManagementTests(unittest.TestCase):
         self.assertEqual(before, gateway.CONFIG.read_bytes())
         allow.assert_not_called()
         delete.assert_not_called()
+
+    def test_add_socks_assigns_distinct_primary_nodes_and_fallback_groups(self):
+        self._seed_provider(["node-a", "node-b", "node-c"])
+
+        with mock.patch.object(gateway, "validate_and_restart"), \
+             mock.patch.object(gateway, "ufw_allow", return_value=False):
+            first = gateway.add_socks(1100, "AUTO")
+            second = gateway.add_socks(1101, "AUTO")
+
+        self.assertEqual("independent", first["mode"])
+        self.assertNotEqual(first["primary"], second["primary"])
+        cfg = gateway.load_cfg()
+        listeners = {row["port"]: row for row in cfg["listeners"]}
+        groups = {row["name"]: row for row in cfg["proxy-groups"]}
+        for port, result in ((1100, first), (1101, second)):
+            route = listeners[port]["proxy"]
+            self.assertEqual(f"MGW-{port}", route)
+            self.assertEqual("fallback", groups[route]["type"])
+            self.assertEqual(60, groups[route]["interval"])
+            self.assertTrue(groups[route]["lazy"])
+            self.assertEqual(401, groups[route]["expected-status"])
+            primary_name, backup_name = groups[route]["proxies"]
+            self.assertEqual("url-test", groups[primary_name]["type"])
+            self.assertEqual("fallback", groups[backup_name]["type"])
+            self.assertEqual("REJECT", groups[primary_name]["empty-fallback"])
+            self.assertEqual("REJECT", groups[backup_name]["empty-fallback"])
+            self.assertEqual(["airport"], groups[primary_name]["use"])
+            self.assertRegex(result["primary"], groups[primary_name]["filter"])
+            self.assertRegex(result["primary"], groups[backup_name]["exclude-filter"])
+            self.assertNotIn("(?:", groups[primary_name]["filter"])
+            self.assertNotIn("(?:", groups[backup_name]["exclude-filter"])
+
+    def test_add_socks_rejects_when_distinct_primary_candidates_are_exhausted(self):
+        self._seed_provider(["node-a", "node-b"])
+
+        with mock.patch.object(gateway, "validate_and_restart"), \
+             mock.patch.object(gateway, "ufw_allow", return_value=False):
+            first = gateway.add_socks(1100, "AUTO")
+            second = gateway.add_socks(1101, "AUTO")
+            with self.assertRaisesRegex(RuntimeError, "distinct healthy primary"):
+                gateway.add_socks(1102, "AUTO")
+
+        self.assertFalse(first["reused"])
+        self.assertFalse(second["reused"])
+        self.assertNotEqual(first["primary"], second["primary"])
+        self.assertEqual(2, len(gateway.list_socks(gateway.load_cfg())))
+
+    def test_add_socks_prefers_runtime_healthy_provider_nodes(self):
+        self._seed_provider(["dead-node", "healthy-one", "healthy-two"])
+
+        with mock.patch.object(gateway, "validate_and_restart"), \
+             mock.patch.object(gateway, "ufw_allow", return_value=False):
+            created = gateway.add_socks(
+                1100,
+                "AUTO",
+                healthy_names={"healthy-one", "healthy-two"},
+            )
+
+        self.assertEqual("healthy-one", created["primary"])
+
+    def test_provider_scoped_health_rejects_same_name_from_other_provider(self):
+        self._seed_provider(["shared", "backup"], "first")
+        cfg = gateway.load_cfg()
+        cfg["proxy-providers"]["second"] = {
+            "type": "file",
+            "path": "./providers/second.yaml",
+        }
+        gateway.save_cfg(cfg)
+        (gateway.PROVIDERS_DIR / "second.yaml").write_text(
+            yaml.safe_dump(
+                {"proxies": [{"name": "shared", "type": "direct"}]},
+                sort_keys=False,
+            ),
+            encoding="utf-8",
+        )
+
+        with mock.patch.object(gateway, "validate_and_restart") as restart:
+            with self.assertRaisesRegex(RuntimeError, "at least two"):
+                gateway.add_socks(
+                    1100,
+                    "AUTO",
+                    healthy_names={("second", "shared"), ("first", "backup")},
+                )
+
+        restart.assert_not_called()
+
+    def test_duplicate_node_names_keep_provider_scoped_primary_identity(self):
+        self._seed_provider(["shared"], "first")
+        cfg = gateway.load_cfg()
+        cfg["proxy-providers"]["second"] = {
+            "type": "file",
+            "path": "./providers/second.yaml",
+        }
+        for group in cfg["proxy-groups"]:
+            group["use"] = ["first", "second"]
+        gateway.save_cfg(cfg)
+        (gateway.PROVIDERS_DIR / "second.yaml").write_text(
+            yaml.safe_dump(
+                {"proxies": [
+                    {"name": "shared", "type": "direct"},
+                    {"name": "backup", "type": "direct"},
+                ]},
+                sort_keys=False,
+            ),
+            encoding="utf-8",
+        )
+        healthy = {
+            ("first", "shared"),
+            ("second", "shared"),
+            ("second", "backup"),
+        }
+
+        with mock.patch.object(gateway, "validate_and_restart"), \
+             mock.patch.object(gateway, "ufw_allow", return_value=False):
+            first = gateway.add_socks(1100, "AUTO", healthy_names=healthy)
+            second = gateway.add_socks(1101, "AUTO", healthy_names=healthy)
+
+        self.assertEqual("shared", first["primary"])
+        self.assertEqual("shared", second["primary"])
+        self.assertNotEqual(first["primary_provider"], second["primary_provider"])
+        groups = {group["name"]: group for group in gateway.load_cfg()["proxy-groups"]}
+        for port, result in ((1100, first), (1101, second)):
+            primary_group = groups[groups[f"MGW-{port}"]["proxies"][0]]
+            self.assertEqual([result["primary_provider"]], primary_group["use"])
+
+    def test_add_socks_requires_a_distinct_backup_candidate(self):
+        self._seed_provider(["only-node"])
+
+        with mock.patch.object(gateway, "validate_and_restart") as restart, \
+             mock.patch.object(gateway, "ufw_allow") as allow:
+            with self.assertRaisesRegex(RuntimeError, "at least two"):
+                gateway.add_socks(1100, "AUTO", healthy_names={"only-node"})
+
+        restart.assert_not_called()
+        allow.assert_not_called()
+
+    def test_add_socks_rejects_independent_route_without_provider_nodes(self):
+        before = gateway.CONFIG.read_bytes()
+
+        with mock.patch.object(gateway, "validate_and_restart") as restart, \
+             mock.patch.object(gateway, "ufw_allow") as allow:
+            with self.assertRaisesRegex(RuntimeError, "eligible provider node"):
+                gateway.add_socks(1100, "AUTO")
+
+        self.assertEqual(before, gateway.CONFIG.read_bytes())
+        restart.assert_not_called()
+        allow.assert_not_called()
+
+    def test_migrate_socks_preserves_source_filter_and_credentials(self):
+        self._seed_provider(["US-one", "JP-one", "US-two"])
+        cfg = gateway.load_cfg()
+        cfg["proxy-groups"].append({
+            "name": "GPT",
+            "type": "url-test",
+            "use": ["airport"],
+            "filter": "US",
+            "exclude-filter": "(?i)(blocked)",
+        })
+        cfg["listeners"] = [{
+            "name": "existing",
+            "type": "socks",
+            "port": 1100,
+            "listen": "0.0.0.0",
+            "users": [{"username": "keep-user", "password": "keep-pass"}],
+            "proxy": "GPT",
+        }]
+        gateway.save_cfg(cfg)
+
+        with mock.patch.object(gateway, "validate_and_restart") as restart, \
+             mock.patch.object(gateway, "ufw_allow") as allow, \
+             mock.patch.object(gateway, "ufw_delete") as delete:
+            result = gateway.migrate_socks()
+
+        self.assertEqual(1, result["migrated"])
+        self.assertEqual("US-one", result["socks"][0]["primary"])
+        current = gateway.load_cfg()
+        listener = current["listeners"][0]
+        self.assertEqual([{"username": "keep-user", "password": "keep-pass"}], listener["users"])
+        groups = {row["name"]: row for row in current["proxy-groups"]}
+        primary_name, backup_name = groups[listener["proxy"]]["proxies"]
+        self.assertEqual(["airport"], groups[primary_name]["use"])
+        self.assertEqual("US", groups[backup_name]["filter"])
+        self.assertIn("blocked", groups[backup_name]["exclude-filter"])
+        self.assertTrue(groups[backup_name]["exclude-filter"].startswith("(?i)"))
+        self.assertNotIn("(?:", groups[backup_name]["exclude-filter"])
+        restart.assert_called_once_with()
+        allow.assert_not_called()
+        delete.assert_not_called()
+
+    def test_migrate_socks_uses_runtime_selection_for_top_level_select_group(self):
+        self._seed_provider(["US-one", "JP-one", "US-two"])
+        cfg = gateway.load_cfg()
+        cfg["proxy-groups"] = [
+            {"name": "PROXY", "type": "select", "proxies": ["AUTO", "GPT"]},
+            {"name": "AUTO", "type": "url-test", "use": ["airport"]},
+            {"name": "GPT", "type": "url-test", "use": ["airport"], "filter": "US"},
+        ]
+        cfg["listeners"] = [{
+            "name": "existing",
+            "type": "socks",
+            "port": 1100,
+            "users": [{"username": "user", "password": "pass"}],
+            "proxy": "PROXY",
+        }]
+        gateway.save_cfg(cfg)
+
+        with mock.patch.object(gateway, "validate_and_restart"):
+            result = gateway.migrate_socks(
+                healthy_names={"US-one", "US-two", "JP-one"},
+                selected_groups={"PROXY": "GPT"},
+            )
+
+        self.assertEqual("US-one", result["socks"][0]["primary"])
+        groups = {row["name"]: row for row in gateway.load_cfg()["proxy-groups"]}
+        route = groups["MGW-1100"]
+        backup = groups[route["proxies"][1]]
+        self.assertEqual("US", backup["filter"])
+
+    def test_select_group_with_provider_use_prefers_runtime_selected_node(self):
+        self._seed_provider(["node-a", "node-b", "node-c"])
+
+        with mock.patch.object(gateway, "validate_and_restart"), \
+             mock.patch.object(gateway, "ufw_allow", return_value=False):
+            result = gateway.add_socks(
+                1100,
+                "自定义",
+                healthy_names={
+                    ("airport", "node-a"),
+                    ("airport", "node-b"),
+                    ("airport", "node-c"),
+                },
+                selected_groups={"自定义": "node-b"},
+            )
+
+        self.assertEqual("node-b", result["primary"])
+
+    def test_migrate_socks_is_idempotent(self):
+        self._seed_provider(["node-a", "node-b"])
+        cfg = gateway.load_cfg()
+        cfg["listeners"] = [
+            {"name": "one", "type": "socks", "port": 1100, "users": [], "proxy": "AUTO"},
+            {"name": "two", "type": "socks", "port": 1101, "users": [], "proxy": "AUTO"},
+        ]
+        gateway.save_cfg(cfg)
+
+        with mock.patch.object(gateway, "validate_and_restart") as restart:
+            first = gateway.migrate_socks()
+            after_first = gateway.CONFIG.read_bytes()
+            second = gateway.migrate_socks()
+
+        self.assertEqual(2, first["migrated"])
+        self.assertEqual(0, second["migrated"])
+        self.assertEqual(2, second["skipped"])
+        self.assertEqual(after_first, gateway.CONFIG.read_bytes())
+        restart.assert_called_once_with()
+        self.assertEqual(
+            2,
+            len({row["primary"] for row in gateway.list_socks(gateway.load_cfg())}),
+        )
+
+    def test_migrate_socks_keeps_fixed_primary_when_temporarily_unhealthy(self):
+        self._seed_provider(["node-a", "node-b", "node-c"])
+        cfg = gateway.load_cfg()
+        cfg["listeners"] = [
+            {"name": "one", "type": "socks", "port": 1100, "users": [], "proxy": "AUTO"},
+            {"name": "two", "type": "socks", "port": 1101, "users": [], "proxy": "AUTO"},
+        ]
+        gateway.save_cfg(cfg)
+
+        with mock.patch.object(gateway, "validate_and_restart"):
+            gateway.migrate_socks()
+            before = gateway.CONFIG.read_bytes()
+            result = gateway.migrate_socks(healthy_names={"node-b", "node-c"})
+
+        rows = {row["port"]: row for row in gateway.list_socks(gateway.load_cfg())}
+        self.assertEqual(0, result["migrated"])
+        self.assertEqual(2, result["skipped"])
+        self.assertEqual(before, gateway.CONFIG.read_bytes())
+        self.assertEqual("node-a", rows[1100]["primary"])
+        self.assertEqual("node-b", rows[1101]["primary"])
+
+    def test_migrate_socks_rolls_back_when_restart_fails(self):
+        self._seed_provider(["node-a", "node-b"])
+        cfg = gateway.load_cfg()
+        cfg["listeners"] = [
+            {"name": "one", "type": "socks", "port": 1100, "users": [], "proxy": "AUTO"},
+        ]
+        gateway.save_cfg(cfg)
+        before = gateway.CONFIG.read_bytes()
+
+        with mock.patch.object(
+            gateway,
+            "validate_and_restart",
+            side_effect=[RuntimeError("not ready"), None],
+        ):
+            with self.assertRaisesRegex(RuntimeError, "not ready"):
+                gateway.migrate_socks()
+
+        self.assertEqual(before, gateway.CONFIG.read_bytes())
+
+    def test_migrate_socks_reports_rollback_restart_failure(self):
+        self._seed_provider(["node-a", "node-b"])
+        cfg = gateway.load_cfg()
+        cfg["listeners"] = [
+            {"name": "one", "type": "socks", "port": 1100, "users": [], "proxy": "AUTO"},
+        ]
+        gateway.save_cfg(cfg)
+
+        with mock.patch.object(
+            gateway,
+            "validate_and_restart",
+            side_effect=[RuntimeError("migration failed"), RuntimeError("rollback failed")],
+        ):
+            with self.assertRaisesRegex(RuntimeError, "rollback restart failed"):
+                gateway.migrate_socks()
+
+    def test_delete_socks_removes_its_managed_groups(self):
+        self._seed_provider(["node-a", "node-b"])
+        with mock.patch.object(gateway, "validate_and_restart"), \
+             mock.patch.object(gateway, "ufw_allow", return_value=False):
+            created = gateway.add_socks(1100, "AUTO")
+
+        with mock.patch.object(gateway, "validate_and_restart"), \
+             mock.patch.object(gateway, "ufw_delete", return_value=False):
+            gateway.del_socks(port=1100)
+
+        group_names = {row["name"] for row in gateway.load_cfg()["proxy-groups"]}
+        self.assertNotIn(created["route"], group_names)
+        self.assertFalse(any(name.startswith("MGW-1100-") for name in group_names))
+
+    def test_delete_last_provider_rejects_managed_routes_instead_of_using_direct(self):
+        self._seed_provider(["node-a", "node-b"])
+        with mock.patch.object(gateway, "validate_and_restart"), \
+             mock.patch.object(gateway, "ufw_allow", return_value=False):
+            created = gateway.add_socks(1100, "AUTO")
+
+        with mock.patch.object(gateway, "validate_and_restart"):
+            gateway.del_provider("airport")
+
+        groups = {row["name"]: row for row in gateway.load_cfg()["proxy-groups"]}
+        primary_name, backup_name = groups[created["route"]]["proxies"]
+        self.assertEqual(["REJECT"], groups[primary_name]["proxies"])
+        self.assertEqual(["REJECT"], groups[backup_name]["proxies"])
+        self.assertEqual(["REJECT"], groups["AUTO"]["proxies"])
+
+    def test_provider_health_checks_run_every_sixty_seconds(self):
+        body = yaml.safe_dump(
+            {"proxies": [{"name": "node-a", "type": "direct"}]},
+            sort_keys=False,
+        ).encode()
+
+        with mock.patch.object(gateway, "validate_and_restart"):
+            gateway.add_static_provider("local", body)
+
+        provider = gateway.load_cfg()["proxy-providers"]["local"]
+        self.assertEqual(60, provider["health-check"]["interval"])
+        self.assertFalse(provider["health-check"].get("lazy", False))
+        self.assertEqual("https://api.openai.com/v1/models", provider["health-check"]["url"])
+        self.assertEqual(401, provider["health-check"]["expected-status"])
+        for group in gateway.load_cfg()["proxy-groups"]:
+            if group.get("use"):
+                self.assertEqual("REJECT", group["empty-fallback"])
+                if group.get("type") in {"url-test", "fallback"}:
+                    self.assertEqual("https://api.openai.com/v1/models", group["url"])
+                    self.assertEqual(401, group["expected-status"])
+
+    def test_runtime_proxy_state_is_required_for_api_mutations(self):
+        with mock.patch.object(gateway, "runtime_proxy_state", return_value=None):
+            with self.assertRaisesRegex(RuntimeError, "health status unavailable"):
+                gateway.require_runtime_proxy_state()
+
+    def test_runtime_proxy_state_combines_provider_health_and_group_selection(self):
+        provider_payload = json.dumps({
+            "providers": {
+                "airport": {
+                    "proxies": [
+                        {"name": "node-a", "alive": True},
+                        {"name": "node-b", "alive": False},
+                    ],
+                },
+            },
+        }).encode()
+        group_payload = json.dumps({
+            "proxies": {
+                "PROXY": {"type": "Selector", "now": "GPT"},
+                "GPT": {"type": "URLTest", "now": "node-a"},
+            },
+        }).encode()
+
+        def fake_open(request, timeout):
+            if request.full_url.endswith("/providers/proxies"):
+                return _Response(provider_payload)
+            return _Response(group_payload)
+
+        with mock.patch.object(gateway.urllib.request, "urlopen", side_effect=fake_open):
+            state = gateway.runtime_proxy_state()
+
+        self.assertEqual({("airport", "node-a")}, state["healthy"])
+        self.assertEqual("GPT", state["selected"]["PROXY"])
+
+    def test_fresh_proxy_state_transaction_updates_health_before_action(self):
+        self._seed_provider(["node-a", "node-b"])
+
+        def fresh_state(refresh=False):
+            self.assertTrue(refresh)
+            health = gateway.load_cfg()["proxy-providers"]["airport"]["health-check"]
+            self.assertEqual("https://api.openai.com/v1/models", health["url"])
+            self.assertEqual(401, health["expected-status"])
+            return {"healthy": {"node-a", "node-b"}, "selected": {}}
+
+        with mock.patch.object(gateway, "validate_and_restart") as restart, \
+             mock.patch.object(gateway, "require_runtime_proxy_state", side_effect=fresh_state):
+            result = gateway.with_fresh_proxy_state(lambda state: len(state["healthy"]))
+
+        self.assertEqual(2, result)
+        restart.assert_called_once_with()
+
+    def test_fresh_proxy_state_transaction_restores_config_when_refresh_fails(self):
+        self._seed_provider(["node-a", "node-b"])
+        before = gateway.CONFIG.read_bytes()
+
+        with mock.patch.object(gateway, "validate_and_restart", side_effect=[None, None]) as restart, \
+             mock.patch.object(
+                 gateway,
+                 "require_runtime_proxy_state",
+                 side_effect=RuntimeError("health refresh failed"),
+             ):
+            with self.assertRaisesRegex(RuntimeError, "health refresh failed"):
+                gateway.with_fresh_proxy_state(lambda state: state)
+
+        self.assertEqual(before, gateway.CONFIG.read_bytes())
+        self.assertEqual(2, restart.call_count)
 
     def test_delete_socks_rolls_back_when_restart_fails(self):
         cfg = gateway.load_cfg()
@@ -518,17 +988,23 @@ class ProviderManagementTests(unittest.TestCase):
 
     def test_fetch_timeout_is_a_total_budget_across_user_agents(self):
         def slow_failure(*_args, **_kwargs):
-            time.sleep(0.03)
             raise RuntimeError("network failed")
 
-        started = time.monotonic()
         with mock.patch.object(gateway, "_assert_safe_subscription_url"), \
-             mock.patch.object(gateway, "_open_subscription", side_effect=slow_failure) as opened:
+             mock.patch.object(
+                 gateway.time,
+                 "monotonic",
+                 side_effect=[0.0, 0.01, 0.03, 0.06],
+             ), \
+             mock.patch.object(
+                 gateway,
+                 "_open_subscription",
+                 side_effect=slow_failure,
+             ) as opened:
             with self.assertRaisesRegex(RuntimeError, "timed out"):
                 gateway.fetch_subscription("https://example.com/sub", timeout=0.05)
 
-        self.assertLess(time.monotonic() - started, 0.15)
-        self.assertLessEqual(opened.call_count, 2)
+        self.assertEqual(2, opened.call_count)
 
     def test_http_429_preserves_retry_after_header(self):
         addresses = [
@@ -919,7 +1395,7 @@ class _Response:
     def __exit__(self, *_args):
         return False
 
-    def read(self, _limit):
+    def read(self, _limit=None):
         return self.body
 
     def geturl(self):

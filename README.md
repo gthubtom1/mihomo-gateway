@@ -7,6 +7,7 @@ One-click Mihomo (Clash.Meta) public SOCKS5 gateway for VPS, with MetaCubeXD pan
 - Convert airport subscriptions into public authenticated SOCKS5 endpoints
 - Accept Clash/Mihomo YAML plus common Base64, URI, Surge, Quantumult, and similar subscription formats through a pinned Sub-Store parser
 - Multi-group routing: AUTO / GPT / region groups
+- Distinct OpenAI-capable primary egress per SOCKS5 listener with 60-second automatic failover
 - MetaCubeXD dashboard on port 9090
 - Sidebar tools: create/delete SOCKS5 ports, add/delete subscription URLs, and import local YAML files
 - systemd services + Nginx static UI with WebSocket overview
@@ -23,6 +24,8 @@ One-click Mihomo (Clash.Meta) public SOCKS5 gateway for VPS, with MetaCubeXD pan
 ```bash
 curl -fsSL https://raw.githubusercontent.com/gthubtom1/mihomo-gateway/main/bootstrap.sh | bash
 ```
+
+The same command detects an existing installation and performs a backed-up in-place upgrade. It does not regenerate credentials, clear providers, or rebuild the existing Mihomo config.
 
 Or:
 
@@ -70,6 +73,8 @@ The installer does not print the Secret or SOCKS password to stdout. Run `mihomo
 Left sidebar **SOCKS5**:
 
 - create/delete public SOCKS5 ports
+- assign a distinct primary provider node to each new port and fail over automatically
+- migrate legacy ports to independent egress without changing their credentials
 - add/delete airport subscription URLs (writes providers and reloads)
 - import/delete local Clash or Mihomo YAML files as static providers
 
@@ -84,6 +89,7 @@ systemctl status mihomo mihomo-gateway-api nginx
 journalctl -u mihomo -f
 mihomo-gateway status
 mihomo-gateway socks list
+mihomo-gateway socks migrate
 mihomo-gateway provider list
 ```
 

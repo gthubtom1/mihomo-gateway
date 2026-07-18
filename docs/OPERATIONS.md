@@ -75,8 +75,11 @@ The expected converter version and checksum are recorded in `scripts/common.sh`.
 ```bash
 mihomo-gateway socks add 1100 GPT
 mihomo-gateway socks list
+mihomo-gateway socks migrate
 mihomo-gateway socks del 1100
 ```
+
+New listeners use independent egress by default. The migration command keeps every existing port, listener name, username, password, and runtime-selected source group while assigning distinct primary nodes where enough healthy nodes exist. Node identity includes both provider and node name, so equal names from different providers cannot corrupt health or assignment state. At least two OpenAI-capable healthy candidates are required, and primary identities are never reused. Provider nodes are checked against the OpenAI API every 60 seconds, with the expected unauthenticated `401` response treated as healthy. Each listener automatically falls back to another eligible node and returns to its fixed primary after recovery. Running migration again leaves every already-managed primary unchanged, including temporarily unhealthy primaries.
 
 ## Upgrade
 
@@ -85,5 +88,7 @@ cd /path/to/mihomo-gateway
 git pull
 bash install.sh
 ```
+
+When an installation already exists, `install.sh` uses a backed-up in-place upgrade path and preserves the current config, provider files, ports, and credentials. A failed upgrade or listener migration restores the previous runtime files.
 
 Set `FORCE_MIHOMO_REINSTALL=1` to force binary reinstall.

@@ -11,6 +11,7 @@ STATE_ROOT="/root/${GATEWAY_NAME}"
 BACKUP_ROOT="${BACKUP_ROOT:-/root/mihomo-backups}"
 CRED_FILE="${STATE_ROOT}/credentials.txt"
 ENV_FILE="${STATE_ROOT}/env"
+GATEWAY_CLI_PATH="${GATEWAY_CLI_PATH:-/usr/local/bin/mihomo-gateway}"
 PANEL_API_PORT_DEFAULT=9092
 PANEL_PORT_DEFAULT=9090
 SOCKS_PORT_DEFAULT=1080
@@ -28,6 +29,78 @@ die()  { echo -e "[x] $*" >&2; exit 1; }
 
 require_root() {
   [[ "$(id -u)" -eq 0 ]] || die "please run as root"
+}
+
+is_existing_install() {
+  [[ -s "${ENV_FILE}" && -s "${RUNTIME_ROOT}/config.yaml" \
+    && -f "${INSTALL_ROOT}/panel/app.py" ]]
+}
+
+has_existing_state() {
+  [[ -e "${ENV_FILE}" || -e "${RUNTIME_ROOT}/config.yaml" ]] \
+    || compgen -G "${RUNTIME_ROOT}/providers/*.yaml" >/dev/null
+}
+
+require_complete_existing_install() {
+  is_existing_install \
+    || die "partial existing installation detected; refusing destructive fresh install"
+}
+
+restore_existing_upgrade() {
+  local backup_dir="$1"
+  cp -a -- "${backup_dir}/config.yaml" "${RUNTIME_ROOT}/config.yaml"
+  cp -a -- "${backup_dir}/app.py" "${INSTALL_ROOT}/panel/app.py"
+  cp -a -- "${backup_dir}/inject.html" "${INSTALL_ROOT}/panel/inject.html"
+  cp -a -- "${backup_dir}/convert-subscription.mjs" "${INSTALL_ROOT}/panel/convert-subscription.mjs"
+  cp -a -- "${backup_dir}/mihomo-gateway" "${GATEWAY_CLI_PATH}"
+  if [[ -d "${backup_dir}/providers" ]]; then
+    mkdir -p "${RUNTIME_ROOT}/providers"
+    cp -a -- "${backup_dir}/providers/." "${RUNTIME_ROOT}/providers/"
+  fi
+  rm -rf -- "${RUNTIME_ROOT}/ui"
+  if [[ -f "${backup_dir}/ui.present" ]]; then
+    mkdir -p "${RUNTIME_ROOT}/ui"
+    cp -a -- "${backup_dir}/ui/." "${RUNTIME_ROOT}/ui/"
+  fi
+  chmod 600 "${RUNTIME_ROOT}/config.yaml"
+  systemctl restart mihomo mihomo-gateway-api nginx
+}
+
+upgrade_existing_install() {
+  # shellcheck disable=SC1090
+  source "${ENV_FILE}"
+  local backup_dir failed=0
+  backup_dir="${BACKUP_ROOT}/upgrade-$(date +%Y%m%d-%H%M%S)-$$"
+  mkdir -p "${backup_dir}/providers"
+  cp -a -- "${RUNTIME_ROOT}/config.yaml" "${backup_dir}/config.yaml"
+  cp -a -- "${INSTALL_ROOT}/panel/app.py" "${backup_dir}/app.py"
+  cp -a -- "${INSTALL_ROOT}/panel/inject.html" "${backup_dir}/inject.html"
+  cp -a -- "${INSTALL_ROOT}/panel/convert-subscription.mjs" "${backup_dir}/convert-subscription.mjs"
+  cp -a -- "${GATEWAY_CLI_PATH}" "${backup_dir}/mihomo-gateway"
+  cp -a -- "${RUNTIME_ROOT}/providers/." "${backup_dir}/providers/"
+  if [[ -d "${RUNTIME_ROOT}/ui" ]]; then
+    mkdir -p "${backup_dir}/ui"
+    touch "${backup_dir}/ui.present"
+    cp -a -- "${RUNTIME_ROOT}/ui/." "${backup_dir}/ui/"
+  fi
+
+  log "upgrading existing Mihomo Gateway in place"
+  install_panel_api || failed=1
+  [[ "${failed}" -ne 0 ]] || python3 -m py_compile "${INSTALL_ROOT}/panel/app.py" || failed=1
+  [[ "${failed}" -ne 0 ]] || mihomo -t -d "${RUNTIME_ROOT}" >/dev/null || failed=1
+  [[ "${failed}" -ne 0 ]] || systemctl restart mihomo-gateway-api nginx || failed=1
+  [[ "${failed}" -ne 0 ]] || mihomo-gateway socks migrate >/dev/null || failed=1
+  [[ "${failed}" -ne 0 ]] || systemctl is-active --quiet mihomo || failed=1
+  [[ "${failed}" -ne 0 ]] || systemctl is-active --quiet mihomo-gateway-api || failed=1
+  [[ "${failed}" -ne 0 ]] || systemctl is-active --quiet nginx || failed=1
+
+  if [[ "${failed}" -ne 0 ]]; then
+    warn "upgrade failed; restoring ${backup_dir}"
+    restore_existing_upgrade "${backup_dir}" \
+      || die "upgrade and automatic restore failed; backup: ${backup_dir}"
+    die "upgrade failed; previous version restored"
+  fi
+  ok "upgrade complete; backup: ${backup_dir}"
 }
 
 detect_public_ip() {
@@ -193,13 +266,20 @@ import_initial_subscriptions() {
   done <<< "${records}"
 }
 
+migrate_initial_socks() {
+  [[ -n "${SUB_URLS:-}" ]] || return 0
+  log "enabling independent SOCKS5 egress"
+  mihomo-gateway socks migrate >/dev/null \
+    || die "failed to migrate the initial SOCKS5 listener"
+}
+
 install_panel_api() {
   log "installing panel API"
   mkdir -p "${INSTALL_ROOT}/panel"
   install -m 755 "${ROOT_DIR}/panel/app.py" "${INSTALL_ROOT}/panel/app.py"
   install -m 644 "${ROOT_DIR}/panel/inject.html" "${INSTALL_ROOT}/panel/inject.html"
   install -m 644 "${ROOT_DIR}/panel/convert-subscription.mjs" "${INSTALL_ROOT}/panel/convert-subscription.mjs"
-  install -m 755 "${ROOT_DIR}/scripts/mihomo-gateway" /usr/local/bin/mihomo-gateway
+  install -m 755 "${ROOT_DIR}/scripts/mihomo-gateway" "${GATEWAY_CLI_PATH}"
 
   # download metacubexd UI if missing
   if [[ ! -f "${RUNTIME_ROOT}/ui/index.html" ]]; then

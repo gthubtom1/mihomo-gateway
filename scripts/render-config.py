@@ -69,14 +69,16 @@ def main():
     groups.append({
         "name": "PROXY",
         "type": "select",
-        "proxies": ["AUTO", "GPT", "美国", "日本", "新加坡", "台湾", "香港", "故障转移", "自定义", "DIRECT"],
+        "proxies": ["AUTO", "GPT", "美国", "日本", "新加坡", "台湾", "香港", "故障转移", "自定义"],
     })
     groups.append({
         "name": "AUTO",
         "type": "url-test",
         "use": provider_names,
-        "proxies": ["DIRECT"],
-        "url": "https://www.gstatic.com/generate_204",
+        "empty-fallback": "REJECT",
+        "proxies": ["REJECT"],
+        "url": "https://api.openai.com/v1/models",
+        "expected-status": 401,
         "interval": 300,
         "tolerance": 80,
     })
@@ -84,9 +86,11 @@ def main():
         "name": "GPT",
         "type": "url-test",
         "use": provider_names,
-        "proxies": ["DIRECT"],
+        "empty-fallback": "REJECT",
+        "proxies": ["REJECT"],
         "filter": r"(?i)(gpt|openai|chatgpt|解锁|原生|美国|美國|日本|新加坡|台湾|臺灣|us|usa|jp|japan|sg|singapore|tw|taiwan)",
-        "url": "https://www.gstatic.com/generate_204",
+        "url": "https://api.openai.com/v1/models",
+        "expected-status": 401,
         "interval": 300,
         "tolerance": 100,
     })
@@ -101,9 +105,11 @@ def main():
             "name": gname,
             "type": "url-test",
             "use": provider_names,
-            "proxies": ["DIRECT"],
+            "empty-fallback": "REJECT",
+            "proxies": ["REJECT"],
             "filter": flt,
-            "url": "https://www.gstatic.com/generate_204",
+            "url": "https://api.openai.com/v1/models",
+            "expected-status": 401,
             "interval": 300,
             "tolerance": 80,
         }
@@ -114,15 +120,18 @@ def main():
         "name": "故障转移",
         "type": "fallback",
         "use": provider_names,
-        "proxies": ["DIRECT"],
-        "url": "https://www.gstatic.com/generate_204",
+        "empty-fallback": "REJECT",
+        "proxies": ["REJECT"],
+        "url": "https://api.openai.com/v1/models",
+        "expected-status": 401,
         "interval": 300,
     })
     groups.append({
         "name": "自定义",
         "type": "select",
         "use": provider_names,
-        "proxies": ["DIRECT"],
+        "empty-fallback": "REJECT",
+        "proxies": ["REJECT"],
     })
     cfg["proxy-groups"] = groups
 

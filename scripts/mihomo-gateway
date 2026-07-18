@@ -88,7 +88,8 @@ case "${cmd}" in
         [[ -n "${port}" ]] || { echo "usage: mihomo-gateway socks del <port>"; exit 1; }
         api DELETE "/panel-api/socks?port=${port}" | python3 -m json.tool
         ;;
-      *) echo "usage: mihomo-gateway socks list|add|del"; exit 1 ;;
+      migrate) api POST /panel-api/socks/migrate | python3 -m json.tool ;;
+      *) echo "usage: mihomo-gateway socks list|add|del|migrate"; exit 1 ;;
     esac
     ;;
   provider)
